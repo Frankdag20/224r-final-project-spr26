@@ -130,10 +130,11 @@ def train(
                 is_response_token = batch['is_response_token'].to(device)
 
                 # compute logits
-                gen_logits = model.generate(input_ids, attention_mask=attention_mask).logits
+                gen_logits = model(input_ids, attention_mask=attention_mask).logits
                 logprobs = F.log_softmax(gen_logits, dim=-1)
 
                 # todo - compute accuracy?
+                # take argmax across logprobs
 
 
 
