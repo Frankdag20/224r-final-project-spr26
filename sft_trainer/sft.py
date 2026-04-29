@@ -77,14 +77,73 @@ def train(
     gradient_accumulation_steps=1, 
     gradient_clipping=1.0
 ):
-    # TODO(student): implement the SFT optimization loop.
     # Expected high-level flow:
     # 1) Forward pass on `input_ids` and compute token-level log-probs.
     # 2) Mask loss to response tokens only using `is_response_token`.
     # 3) Backprop, optionally clip gradients, then optimizer/scheduler steps.
     # 4) Periodically evaluate on `test_dataloader` and log metrics to W&B.
     # 5) Save checkpoints under `output_dir` when requested.
-    raise NotImplementedError("SFT is not implemented for the student project")
+
+    for e in range(num_epochs):
+        optimizer.zero_grad()
+        for idx, batch in enumerate(train_dataloader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            is_response_token = batch['is_response_token'].to(device)
+        
+            preds = model(input_ids, attention_mask=attention_mask).logits
+            logprobs = F.log_softmax(preds, dim=-1)
+
+            # mask loss
+            logprobs[~is_response_token] = -100
+
+            # exclude last token from predictions since there's no labels to predict after
+            shift_log_probs = logprobs[:, :-1, :]
+            # shift labels to exclude first element since nothing beforehand
+            shifted_labels = input_ids[:, 1:].clone()
+
+            # only evaluate loss on responses
+            loss = F.cross_entropy(shift_log_probs, shifted_labels, ignore_index=-100)
+
+            loss.backward()
+
+            # todo - get loss stats and report
+            # todo - get accuracy
+
+            # clip gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = gradient_clipping)
+
+            # accumulate gradients per specified steps
+            if (idx + 1) % gradient_accumulation_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+        
+        # evaluate on test dataloader
+        if e % 10 == 0:
+            if save_model == 1:
+                save_checkpoint(model, tokenizer, scheduler, output_dir)
+            
+            for idx, batch in enumerate(test_dataloader):
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                is_response_token = batch['is_response_token'].to(device)
+
+                # compute logits
+                gen_logits = model.generate(input_ids, attention_mask=attention_mask).logits
+                logprobs = F.log_softmax(gen_logits, dim=-1)
+
+                # todo - compute accuracy?
+
+
+
+
+
+
+
+
+
+
 
 def main():
     parser = argparse.ArgumentParser()
