@@ -84,8 +84,12 @@ def train(
     # 4) Periodically evaluate on `test_dataloader` and log metrics to W&B.
     # 5) Save checkpoints under `output_dir` when requested.
 
-    for e in range(num_epochs):
+    for e in tqdm(range(num_epochs)):
         optimizer.zero_grad()
+        loss_count = 0
+        loss_sum = 0
+        num_correct = 0
+        total = 0
         for idx, batch in enumerate(train_dataloader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -105,21 +109,42 @@ def train(
             # only evaluate loss on responses
             loss = F.cross_entropy(shift_log_probs, shifted_labels, ignore_index=-100)
 
-            loss.backward()
+            loss_count += batch.size(0)
+            loss_sum += loss.item() + batch.size(0)
 
-            # todo - get loss stats and report
-            # todo - get accuracy
+            # scale loss to maintain magnitude of single steps
+            scaled_loss = loss / gradient_accumulation_steps
+            scaled_loss.backward()
+
+            num_correct += torch.sum(torch.argmax(shift_log_probs, axis=-1) == shifted_labels).item()
+            total += shifted_labels.numel()
 
             # clip gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = gradient_clipping)
 
             # accumulate gradients per specified steps
+            # simulates larger batch size
             if (idx + 1) % gradient_accumulation_steps == 0:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
         
+        avg_loss = loss_sum / loss_count
+        avg_accuracy = num_correct / total
+
+        print('================')
+        print('Epoch {e}/{num_epochs}. ')
+        print(f'Train loss {avg_loss:.4f}. Train accuracy {avg_accuracy}.')
+
+        # log to wandb, taken from HW2
+        wandb.log({'sft_train_loss': avg_loss}, step=e)
+        wandb.log({'sft_train_accuracy': avg_accuracy}, step=e)
+
         # evaluate on test dataloader
+        loss_count_e = 0
+        loss_sum_e = 0
+        num_correct_e = 0
+        total_e = 0
         if e % 10 == 0:
             if save_model == 1:
                 save_checkpoint(model, tokenizer, scheduler, output_dir)
@@ -133,9 +158,17 @@ def train(
                 gen_logits = model(input_ids, attention_mask=attention_mask).logits
                 logprobs = F.log_softmax(gen_logits, dim=-1)
 
-                # todo - compute accuracy?
-                # take argmax across logprobs
+                num_correct_e += torch.sum(torch.argmax(shift_log_probs, axis=-1) == shifted_labels).item()
+                total_e += shifted_labels.numel()
 
+        avg_eval_loss = loss_sum_e / loss_count_e
+        avg_eval_accuracy = num_correct_e / total_e
+
+        print(f'Eval loss {avg_eval_loss:.4f}. Eval accuracy {avg_eval_accuracy}.')
+
+        # log to wandb, taken from HW2
+        wandb.log({'sft_eval_loss': avg_eval_loss}, step=e)
+        wandb.log({'sft_eval_accuracy': avg_eval_accuracy}, step=e)
 
 
 
