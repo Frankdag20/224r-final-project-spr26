@@ -84,91 +84,124 @@ def train(
     # 4) Periodically evaluate on `test_dataloader` and log metrics to W&B.
     # 5) Save checkpoints under `output_dir` when requested.
 
-    for e in tqdm(range(num_epochs)):
+    global_step = 0 # for tracking gradient update steps
+    for e in tqdm.tqdm(range(num_epochs), desc="epoch"):
+        model.train()
         optimizer.zero_grad()
+        loss_sum = 0.0
         loss_count = 0
-        loss_sum = 0
         num_correct = 0
         total = 0
+
         for idx, batch in enumerate(train_dataloader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            is_response_token = batch['is_response_token'].to(device)
-        
-            preds = model(input_ids, attention_mask=attention_mask).logits
-            logprobs = F.log_softmax(preds, dim=-1)
+            is_response_token = batch['is_response_token'].to(device).bool()
 
-            # mask loss
-            logprobs[~is_response_token] = -100
+            # Build labels: ignore prompt tokens by setting them to -100 
+            labels = input_ids.clone()
+            labels[~is_response_token] = -100
 
-            # exclude last token from predictions since there's no labels to predict after
-            shift_log_probs = logprobs[:, :-1, :]
-            # shift labels to exclude first element since nothing beforehand
-            shifted_labels = input_ids[:, 1:].clone()
+            # pass in labels so HuggingFace CausalLMLoss can compute the loss
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            logits = outputs.logits
 
-            # only evaluate loss on responses
-            loss = F.cross_entropy(shift_log_probs, shifted_labels, ignore_index=-100)
 
-            loss_count += batch.size(0)
-            loss_sum += loss.item() + batch.size(0)
+            # Accumulate gradients and scale by gradient_accumulation_steps
+            (loss / gradient_accumulation_steps).backward()
 
-            # scale loss to maintain magnitude of single steps
-            scaled_loss = loss / gradient_accumulation_steps
-            scaled_loss.backward()
+            with torch.no_grad():
+                shifted_logits = logits[:, :-1, :]
+                shifted_labels = labels[:, 1:]
 
-            num_correct += torch.sum(torch.argmax(shift_log_probs, axis=-1) == shifted_labels).item()
-            total += shifted_labels.numel()
 
-            # clip gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = gradient_clipping)
+                resp_mask = shifted_labels != -100
 
-            # accumulate gradients per specified steps
-            # simulates larger batch size
+                n_response_tokens = resp_mask.sum().item()
+                loss_sum += loss.item() * n_response_tokens
+                loss_count += n_response_tokens
+
+                preds = shifted_logits.argmax(dim=-1)
+                num_correct += ((preds == shifted_labels) & resp_mask).sum().item()
+                total += resp_mask.sum().item()
+
             if (idx + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clipping)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-        
-        avg_loss = loss_sum / loss_count
-        avg_accuracy = num_correct / total
+                global_step += 1
+
+                wandb.log(
+                    {
+                        'sft_train_loss_step': loss.item(),
+                        'lr': scheduler.get_last_lr()[0],
+                    },
+                    step=global_step,
+                )
+
+        # calculate average loss and accuracy per epoch
+        avg_loss = loss_sum / max(loss_count, 1)
+        avg_accuracy = num_correct / max(total, 1)
 
         print('================')
-        print('Epoch {e}/{num_epochs}. ')
-        print(f'Train loss {avg_loss:.4f}. Train accuracy {avg_accuracy}.')
+        print(f'Epoch {e}/{num_epochs}.')
+        print(f'Train loss {avg_loss:.4f}. Train accuracy {avg_accuracy:.4f}.')
 
         # log to wandb, taken from HW2
-        wandb.log({'sft_train_loss': avg_loss}, step=e)
-        wandb.log({'sft_train_accuracy': avg_accuracy}, step=e)
+        wandb.log(
+            {'sft_train_loss_epoch': avg_loss, 'sft_train_accuracy': avg_accuracy},
+            step=global_step,
+        )
 
-        # evaluate on test dataloader
-        loss_count_e = 0
-        loss_sum_e = 0
-        num_correct_e = 0
-        total_e = 0
-        if e % 10 == 0:
+        # evaluate on test dataloader every 10 epochs or on the final epoch
+        if e % 10 == 0 or e == num_epochs - 1:
             if save_model == 1:
-                save_checkpoint(model, tokenizer, scheduler, output_dir)
-            
-            for idx, batch in enumerate(test_dataloader):
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                is_response_token = batch['is_response_token'].to(device)
+                save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
 
-                # compute logits
-                gen_logits = model(input_ids, attention_mask=attention_mask).logits
-                logprobs = F.log_softmax(gen_logits, dim=-1)
+            model.eval()
+            loss_sum_e = 0.0
+            loss_count_e = 0
+            num_correct_e = 0
+            total_e = 0
 
-                num_correct_e += torch.sum(torch.argmax(shift_log_probs, axis=-1) == shifted_labels).item()
-                total_e += shifted_labels.numel()
+            with torch.inference_mode():
+                for batch in test_dataloader:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+                    is_response_token = batch['is_response_token'].to(device).bool()
 
-        avg_eval_loss = loss_sum_e / loss_count_e
-        avg_eval_accuracy = num_correct_e / total_e
+                    # Build labels: ignore prompt tokens by setting them to -100 
+                    labels = input_ids.clone()
+                    labels[~is_response_token] = -100
 
-        print(f'Eval loss {avg_eval_loss:.4f}. Eval accuracy {avg_eval_accuracy}.')
+                    outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                    logits = outputs.logits
+                    loss = outputs.loss
 
-        # log to wandb, taken from HW2
-        wandb.log({'sft_eval_loss': avg_eval_loss}, step=e)
-        wandb.log({'sft_eval_accuracy': avg_eval_accuracy}, step=e)
+                    shifted_logits = logits[:, :-1, :]
+                    shifted_labels = labels[:, 1:]
+
+                    resp_mask = shifted_labels != -100
+                    n_response_tokens = resp_mask.sum().item()
+                    loss_sum_e += loss.item() * n_response_tokens
+                    loss_count_e += n_response_tokens
+
+                    preds = shifted_logits.argmax(dim=-1)
+                    num_correct_e += ((preds == shifted_labels) & resp_mask).sum().item()
+                    total_e += resp_mask.sum().item()
+
+            avg_eval_loss = loss_sum_e / max(loss_count_e, 1)
+            avg_eval_accuracy = num_correct_e / max(total_e, 1)
+
+            print(f'Eval loss {avg_eval_loss:.4f}. Eval accuracy {avg_eval_accuracy:.4f}.')
+
+            wandb.log(
+                {'sft_eval_loss': avg_eval_loss, 'sft_eval_accuracy': avg_eval_accuracy},
+                step=global_step,
+            )
+        clear_cache(model)
 
 
 
