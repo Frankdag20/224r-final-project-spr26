@@ -13,5 +13,6 @@ __pycache__/
 
 CS224R_Default_Project_Guidelines.pdf
 
-
 eval_results/
+
+.DS_Store

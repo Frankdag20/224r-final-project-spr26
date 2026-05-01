@@ -63,6 +63,49 @@ def save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir):
     }, os.path.join(output_dir, 'train_states.pth'))
     print(f"Model saved to {output_dir}")
 
+def evaluate(model, test_dataloader, device, global_step):
+    model.eval()
+    loss_sum_e = 0.0
+    loss_count_e = 0
+    num_correct_e = 0
+    total_e = 0
+
+    with torch.inference_mode():
+        for batch in test_dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            is_response_token = batch['is_response_token'].to(device).bool()
+
+            # Build labels: ignore prompt tokens by setting them to -100 
+            labels = input_ids.clone()
+            labels[~is_response_token] = -100
+
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            logits = outputs.logits
+            loss = outputs.loss
+
+            shifted_logits = logits[:, :-1, :]
+            shifted_labels = labels[:, 1:]
+
+            resp_mask = shifted_labels != -100
+            n_response_tokens = resp_mask.sum().item()
+            loss_sum_e += loss.item() * n_response_tokens
+            loss_count_e += n_response_tokens
+
+            preds = shifted_logits.argmax(dim=-1)
+            num_correct_e += ((preds == shifted_labels) & resp_mask).sum().item()
+            total_e += resp_mask.sum().item()
+
+    avg_eval_loss = loss_sum_e / max(loss_count_e, 1)
+    avg_eval_accuracy = num_correct_e / max(total_e, 1)
+
+    print(f'Eval loss {avg_eval_loss:.4f}. Eval accuracy {avg_eval_accuracy:.4f}.')
+
+    wandb.log(
+        {'sft_eval_loss': avg_eval_loss, 'sft_eval_accuracy': avg_eval_accuracy},
+        step=global_step,
+    )
+
 def train(
     model, 
     tokenizer, 
@@ -155,55 +198,17 @@ def train(
             step=global_step,
         )
 
+        ########## EVALUATION ##########
         # evaluate on test dataloader every epoch or on the final epoch
         # can change to evaluate every x epochs by changing the % 1 to % x
         if e % 1 == 0 or e == num_epochs - 1:
-            if save_model == 1:
-                save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
+            evaluate(model, test_dataloader, device, global_step)
 
-            model.eval()
-            loss_sum_e = 0.0
-            loss_count_e = 0
-            num_correct_e = 0
-            total_e = 0
-
-            with torch.inference_mode():
-                for batch in test_dataloader:
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-                    is_response_token = batch['is_response_token'].to(device).bool()
-
-                    # Build labels: ignore prompt tokens by setting them to -100 
-                    labels = input_ids.clone()
-                    labels[~is_response_token] = -100
-
-                    outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-                    logits = outputs.logits
-                    loss = outputs.loss
-
-                    shifted_logits = logits[:, :-1, :]
-                    shifted_labels = labels[:, 1:]
-
-                    resp_mask = shifted_labels != -100
-                    n_response_tokens = resp_mask.sum().item()
-                    loss_sum_e += loss.item() * n_response_tokens
-                    loss_count_e += n_response_tokens
-
-                    preds = shifted_logits.argmax(dim=-1)
-                    num_correct_e += ((preds == shifted_labels) & resp_mask).sum().item()
-                    total_e += resp_mask.sum().item()
-
-            avg_eval_loss = loss_sum_e / max(loss_count_e, 1)
-            avg_eval_accuracy = num_correct_e / max(total_e, 1)
-
-            print(f'Eval loss {avg_eval_loss:.4f}. Eval accuracy {avg_eval_accuracy:.4f}.')
-
-            wandb.log(
-                {'sft_eval_loss': avg_eval_loss, 'sft_eval_accuracy': avg_eval_accuracy},
-                step=global_step,
-            )
         clear_cache(model)
 
+    # save model checkpoint after training
+    if save_model == 1:
+        save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
 
 
 
