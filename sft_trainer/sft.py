@@ -115,7 +115,6 @@ def train(
                 shifted_logits = logits[:, :-1, :]
                 shifted_labels = labels[:, 1:]
 
-
                 resp_mask = shifted_labels != -100
 
                 n_response_tokens = resp_mask.sum().item()
@@ -133,6 +132,7 @@ def train(
                 optimizer.zero_grad()
                 global_step += 1
 
+                # log loss per step
                 wandb.log(
                     {
                         'sft_train_loss_step': loss.item(),
@@ -155,8 +155,9 @@ def train(
             step=global_step,
         )
 
-        # evaluate on test dataloader every 10 epochs or on the final epoch
-        if e % 10 == 0 or e == num_epochs - 1:
+        # evaluate on test dataloader every epoch or on the final epoch
+        # can change to evaluate every x epochs by changing the % 1 to % x
+        if e % 1 == 0 or e == num_epochs - 1:
             if save_model == 1:
                 save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
 

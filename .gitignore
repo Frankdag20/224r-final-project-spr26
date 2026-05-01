@@ -12,3 +12,6 @@ __pycache__/
 *downloaded_checkpoints
 
 CS224R_Default_Project_Guidelines.pdf
+
+
+eval_results/
