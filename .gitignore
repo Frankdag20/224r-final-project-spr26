@@ -16,3 +16,6 @@ CS224R_Default_Project_Guidelines.pdf
 eval_results/
 
 .DS_Store
+
+extract_run.py
+run.txt
