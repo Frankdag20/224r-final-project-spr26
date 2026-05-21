@@ -216,4 +216,27 @@ class RLOOUpdateWorker:
         # 4) Add entropy regularization and optional KL penalty to ref model.
         # 5) Backward pass; if `is_update_step`, clip and step optimizer/scheduler.
         # 6) Return scalar metrics used by trainer logging.
-        raise NotImplementedError("This function is not implemented")
+        
+        # Convert everything to tensors since they are all numpy arrays
+        input_ids_torch = torch.from_numpy(input_ids).to(device)
+        attention_mask_torch = torch.from_numpy(attention_mask).to(device)
+        response_mask = torch.from_numpy(is_response_token).to(device).float()
+        rewards_torch = torch.from_numpy(rewards).to(device).float()
+
+        outputs = self.model(input_ids=input_ids_torch, attention_mask=attention_mask_torch)
+
+        # Same logic as done in sft.py
+        shifted_logits = outputs.logits[:, :-1, :]
+        shifted_labels = input_ids_torch[:, 1:]
+        shifted_mask = response_mask[:, 1:]
+
+        #                                [batch*group, vocab, seq len]  [batch*group, seq len] => [batch*group, seq len]
+        token_log_probs = -F.cross_entropy(shifted_logits.transpose(1,2), shifted_labels, reduction='none')
+
+        group = self.group_size
+        batch_size = rewards_torch.shape[0] // group # [batch*group]
+
+        rewards_g = rewards_torch.view(batch_size, group)
+        group_sum = rewards_g.sum(dim=1, keepdim=True)
+        baseline = (group_sum - rewards_g) / (group - 1)
+        adv = (rewards_g - baseline).view(-1)
