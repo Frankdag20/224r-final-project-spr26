@@ -7,6 +7,7 @@ This file is intentionally incomplete. Students are expected to implement
 `update(...)` while reusing the data/model/sampling setup provided here.
 """
 
+import atexit
 import os
 import warnings
 import ray
@@ -208,12 +209,90 @@ class RLOOUpdateWorker:
     ):
         # TODO(student): implement one RLOO policy update.
         # Inputs arrive flattened as [batch_size * group_size, seq_len].
+        # convert inputs to tensors
+        input_ids = torch.from_numpy(input_ids).to(device)
+        attention_mask = torch.from_numpy(attention_mask).to(device)
+        is_response_token = torch.from_numpy(is_response_token).to(device)
+        rewards = torch.from_numpy(rewards).to(device)
+        sample_log_probs = torch.from_numpy(sample_log_probs).to(device) if sample_log_probs is not None else None
         # Required pieces:
         # 1) Compute per-token log-probs on target tokens under current policy.
+        out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        # Use classic causal LM trick, use logits shifted without the last logit
+        # and targets as input_ids shifted w/o first id
+        logits = out.logits[:, :-1, :]
+        target_ids = input_ids[:, 1:]
+        response_mask = is_response_token[:, 1:]
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        seq_log_probs = (target_log_probs * response_mask).sum(dim=-1)
         # 2) Build leave-one-out baseline within each response group.
+        k = self.group_size
+        N = rewards.shape[0]
+        num_prompts = N // k
+
+        grp_rewards = rewards.view(num_prompts, k)
+        grp_mean_reward = grp_rewards.mean(dim=1, keepdim=True)
+        A = (k / (k - 1)) * (grp_rewards - grp_mean_reward)
+        A = A.view(N).detach()
         # 3) Compute policy-gradient loss using advantages (and importance weights
         #    if sample_log_probs are provided).
+        if sample_log_probs is not None:
+            with torch.no_grad():
+                # using clamp values suggested on Ed
+                log_prob_diff = torch.clamp(seq_log_probs - sample_log_probs, min=-20.0, max=20.0)
+                iw = torch.clamp(torch.exp(log_prob_diff), max=100.0)
+        else:
+            iw = torch.ones_like(seq_log_probs)
         # 4) Add entropy regularization and optional KL penalty to ref model.
+        # calculate shannon entropy (I think that's what entropy refers to)
+        token_count = response_mask.sum()
+        ps = log_probs.exp()
+        entropy_per_token = -(ps * log_probs).sum(dim=-1)
+        entropy = (entropy_per_token * response_mask).sum() / token_count
+
+        # calculate kl divergence term
+        if self.kl_divergence_coefficient > 0:
+            with torch.no_grad():
+                ref_model_out = self.ref_model(input_ids=input_ids, attention_mask=attention_mask)
+                ref_model_logits = ref_model_out.logits[:, :-1, :]
+                # gather the log ps for the selected tokens
+                # unsqueeze target_ids so it matches the shape (N, T-1, V) with (N, T-1, 1)
+                ref_log_ps = F.log_softmax(ref_model_logits, dim=-1).gather(
+                    dim = -1,
+                    index = target_ids.unsqueeze(-1)
+                ).squeeze(-1)
+            
+            log_diff = ref_log_ps - target_log_probs
+            kl_term = ((torch.exp(log_diff) - 1.0 - log_diff) * response_mask).sum() / token_count
+        else:
+            kl_term = torch.tensor(0.0, device=device)
+
+        # calculate final loss as sum of policy gradient loss, entropy regularization, and kl divergence term
+        policy_gradient_loss = -(iw * A * seq_log_probs).mean()
+        entropy_loss = -self.entropy_coefficient * entropy
+        kl_divergence_penalty = self.kl_divergence_coefficient * kl_term
+        loss = policy_gradient_loss + entropy_loss + kl_divergence_penalty
         # 5) Backward pass; if `is_update_step`, clip and step optimizer/scheduler.
+        # make sure average loss over gradient accumulation steps is used
+        (loss / self.gradient_accumulation_steps).backward()
+
+        if is_update_step:
+            if self.gradient_clipping > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm = self.gradient_clipping,
+                )
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
         # 6) Return scalar metrics used by trainer logging.
-        raise NotImplementedError("This function is not implemented")
+        metrics = {
+            'policy_gradient_loss': policy_gradient_loss.item(),
+            'entropy': entropy_loss.item(),
+            'kl_loss': kl_divergence_penalty.item(),
+            'loss': loss.item(),
+            'iw_mean': iw.mean().item(),
+        }
+        return metrics

@@ -59,7 +59,7 @@ save_dir="${SAVE_DIR:-/vol/checkpoints/rloo_checkpoints}"
 wandb_name="${WANDB_NAME:-rloo_neb_lr${curr_lr}_bs${batch_size}_gs${group_size}_ent${entropy_coefficient}_kl${kl_divergence_coefficient}_lr${lr_schedule}_warmup${warmup_ratio}_temp${temperature}_topp${top_p}_topk${top_k}}"
 
 command=(
-    modal run "$PROJECT_ROOT/modal_train.py"
+    modal run --detach "$PROJECT_ROOT/modal_train.py"
     rloo
     --model_name "$model_name"
     --ref_model_name "$model_name"
