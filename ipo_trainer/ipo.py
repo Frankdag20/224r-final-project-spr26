@@ -70,6 +70,80 @@ def save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir):
     }, os.path.join(output_dir, 'train_states.pth'))
     print(f"Model saved to {output_dir}")
 
+
+
+def compute_logps(model, input_ids, attention_mask, is_response_token):
+    outputs = model(input_ids, attention_mask=attention_mask)
+    logits = outputs.logits
+
+    shifted_logits = logits[:, :-1, :]
+    shifted_targets = input_ids[:, 1:].clone()
+    resp_mask = is_response_token[:, 1:].bool()
+
+    log_probs = F.log_softmax(shifted_logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, 
+                        index=shifted_targets.unsqueeze(-1)).squeeze(-1)
+
+    token_log_probs_masked = token_log_probs * resp_mask
+
+    summed = token_log_probs_masked.sum(dim=-1)
+
+    length = resp_mask.sum(dim=-1).float().clamp(min=1)
+    
+    return summed / length # OR SHOULD WE RETURN THE SUMMED AND THEN AVERAGE LATER?
+    
+
+def compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta):
+    term_1 = logps_w - logps_ref_w
+    term_2 = logps_l - logps_ref_l
+    h = term_1 - term_2
+    loss = ((h-1/(2*beta))**2).mean()
+
+    reward_margin = (beta*h).mean().item()
+
+    return loss, reward_margin
+
+def evaluate(model, reference_model, test_dataloader, device, beta, global_step):
+    model.eval()
+    loss_sum_e = 0.0
+    loss_count_e = 0
+    eval_reward_margin_sum = 0.0
+
+    with torch.inference_mode():
+        for batch in test_dataloader:
+            input_ids_w = batch['input_ids_w'].to(device)
+            attention_mask_w = batch['attention_mask_w'].to(device)
+            is_response_token_w = batch['is_response_token_w'].to(device).bool()
+            input_ids_l = batch['input_ids_l'].to(device)
+            attention_mask_l = batch['attention_mask_l'].to(device)
+            is_response_token_l = batch['is_response_token_l'].to(device).bool()
+
+            logps_w = compute_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
+            logps_l = compute_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+
+            logps_ref_w = compute_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w)
+            logps_ref_l = compute_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l)
+
+            loss_e, eval_reward_margin = compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta)
+
+            loss_sum_e += loss_e.item()
+            loss_count_e += 1
+            eval_reward_margin_sum += eval_reward_margin
+
+    avg_eval_loss = loss_sum_e / max(loss_count_e, 1)
+    avg_eval_reward_margin = eval_reward_margin_sum / max(loss_count_e, 1)
+    if global_step % 500 == 0:
+        print(f'Eval loss {avg_eval_loss:.4f}.')
+        print(f'Eval reward margin {avg_eval_reward_margin:.4f}.')
+        print('--------------------------------')
+
+    wandb.log(
+        {'ipo_eval_loss': avg_eval_loss, 
+        'ipo_eval_reward_margin': avg_eval_reward_margin},
+        step=global_step,
+    ) 
+    
+
 def train(
     model, 
     tokenizer, 
@@ -94,7 +168,116 @@ def train(
     # 2) Compute frozen-reference log-probs for chosen/rejected responses.
     # 3) Build the pairwise objective (IPO or related variant).
     # 4) Apply gradient accumulation, clipping, logging, and checkpointing.
-    raise NotImplementedError("This function is not implemented")
+    # raise NotImplementedError("This function is not implemented")
+
+    global_step = 0 # for tracking gradient update steps
+    for e in tqdm.tqdm(range(num_epochs), desc="epoch"):
+        model.train()
+        optimizer.zero_grad()
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
+        epoch_reward_margin_sum = 0.0
+        loss_sum = 0.0
+        reward_margin_sum = 0.0
+        loss_count = 0
+        
+        for idx, batch in enumerate(train_dataloader):
+            
+            if idx % 500 == 0:
+                print(f'Batch {idx} of {len(train_dataloader)}')
+                print('--------------------------------')
+
+            input_ids_w = batch['input_ids_w'].to(device)
+            attention_mask_w = batch['attention_mask_w'].to(device)
+            is_response_token_w = batch['is_response_token_w'].to(device).bool()
+            input_ids_l = batch['input_ids_l'].to(device)
+            attention_mask_l = batch['attention_mask_l'].to(device)
+            is_response_token_l = batch['is_response_token_l'].to(device).bool()
+            
+            #compute logps for chosen and rejected responses for both w and l
+            logps_w = compute_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
+            logps_l = compute_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+
+            #no grad for reference model
+            with torch.no_grad():
+                logps_ref_w = compute_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w)
+                logps_ref_l = compute_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l)
+
+            loss, reward_margin = compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta)
+
+            with torch.no_grad():
+                loss_sum += loss.item()
+                reward_margin_sum += reward_margin
+                loss_count += 1
+
+                epoch_loss_sum += loss.item()
+                epoch_reward_margin_sum += reward_margin
+                epoch_loss_count += 1
+
+            # Accumulate gradients and scale by gradient_accumulation_steps
+            (loss / gradient_accumulation_steps).backward()
+
+            if (idx + 1) % gradient_accumulation_steps == 0:
+                if gradient_clipping > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clipping)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                # log loss per step
+                wandb.log(
+                    {
+                        'ipo_train_loss_step': loss_sum/gradient_accumulation_steps,
+                        'ipo_train_reward_margin_step': reward_margin_sum/gradient_accumulation_steps   ,
+                        'lr': scheduler.get_last_lr()[0],
+                    },
+                    step=global_step,
+                )
+                loss_sum = 0.0
+                reward_margin_sum = 0.0
+                loss_count = 0
+
+                ########## EVALUATION ##########
+                # evaluate on test dataloader every epoch or on the final epoch
+                # can change to evaluate every x gradient accumulation steps by changing the % 1 to % x
+                if (idx + 1) % 10 == 0:
+                    evaluate(model, reference_model, test_dataloader, device, beta, global_step)
+                    model.train()
+
+        # NOT USING PER EPOCH LOGGING BECAUSE WE ARE LOGGING PER STEP ABOVE  
+
+        # calculate average loss and accuracy per epoch
+        epoch_avg_loss = epoch_loss_sum / max(epoch_loss_count, 1)
+        epoch_avg_reward_margin = epoch_reward_margin_sum / max(epoch_loss_count, 1)
+        print('================')
+        print(f'Epoch {e}/{num_epochs}.')
+        print(f'Train loss {epoch_avg_loss:.4f}.')
+        print(f'Train reward margin {epoch_avg_reward_margin:.4f}.')
+
+        
+        # # log to wandb, taken from HW2
+        # wandb.log(
+        #     {'ipo_train_loss_epoch': avg_loss, 
+        #     'ipo_train_reward_margin_epoch': avg_reward_margin},
+        #     step=e,
+        # )
+
+        # ########## EVALUATION ##########
+        # # evaluate on test dataloader every epoch or on the final epoch
+        # # can change to evaluate every x epochs by changing the % 1 to % x
+        # if e % 1 == 0 or e == num_epochs - 1:
+        #     evaluate(model, reference_model, test_dataloader, device, beta, e)
+
+        clear_cache(model)
+
+    # save model checkpoint after training
+    if save_model == 1:
+        save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
+
+    
+            
+
 
 def main():
     parser = argparse.ArgumentParser()
