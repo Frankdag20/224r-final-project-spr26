@@ -72,26 +72,28 @@ def save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir):
 
 
 
-def compute_logps(model, input_ids, attention_mask, is_response_token):
+def compute_logps(model, input_ids, attention_mask, is_response_token, average_logps):
     outputs = model(input_ids, attention_mask=attention_mask)
     logits = outputs.logits
 
     shifted_logits = logits[:, :-1, :]
-    shifted_targets = input_ids[:, 1:].clone()
-    resp_mask = is_response_token[:, 1:].bool()
+    shifted_labels = input_ids[:, 1:].clone()
+    # resp_mask = attention_mask[:, 1:].clone()
+    # resp_mask = is_response_token[:, 1:].bool()
+    resp_mask = is_response_token[:, 1:].bool() & attention_mask[:, 1:].bool()
 
     log_probs = F.log_softmax(shifted_logits, dim=-1)
     token_log_probs = log_probs.gather(dim=-1, 
-                        index=shifted_targets.unsqueeze(-1)).squeeze(-1)
+                        index=shifted_labels.unsqueeze(-1)).squeeze(-1)
 
     token_log_probs_masked = token_log_probs * resp_mask
 
     summed = token_log_probs_masked.sum(dim=-1)
-
-    length = resp_mask.sum(dim=-1).float().clamp(min=1)
     
-    return summed / length # OR SHOULD WE RETURN THE SUMMED AND THEN AVERAGE LATER?
-    
+    if average_logps:
+        return summed / resp_mask.sum(dim=-1).float().clamp(min=1)
+    else:
+        return summed
 
 def compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta):
     term_1 = logps_w - logps_ref_w
@@ -103,7 +105,7 @@ def compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta):
 
     return loss, reward_margin
 
-def evaluate(model, reference_model, test_dataloader, device, beta, global_step):
+def evaluate(model, reference_model, test_dataloader, device, beta, global_step, average_logps):
     model.eval()
     loss_sum_e = 0.0
     loss_count_e = 0
@@ -118,11 +120,11 @@ def evaluate(model, reference_model, test_dataloader, device, beta, global_step)
             attention_mask_l = batch['attention_mask_l'].to(device)
             is_response_token_l = batch['is_response_token_l'].to(device).bool()
 
-            logps_w = compute_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
-            logps_l = compute_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+            logps_w = compute_logps(model, input_ids_w, attention_mask_w, is_response_token_w, average_logps)
+            logps_l = compute_logps(model, input_ids_l, attention_mask_l, is_response_token_l, average_logps)
 
-            logps_ref_w = compute_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w)
-            logps_ref_l = compute_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l)
+            logps_ref_w = compute_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w, average_logps)
+            logps_ref_l = compute_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l, average_logps)
 
             loss_e, eval_reward_margin = compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta)
 
@@ -195,13 +197,13 @@ def train(
             is_response_token_l = batch['is_response_token_l'].to(device).bool()
             
             #compute logps for chosen and rejected responses for both w and l
-            logps_w = compute_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
-            logps_l = compute_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+            logps_w = compute_logps(model, input_ids_w, attention_mask_w, is_response_token_w, average_logps)
+            logps_l = compute_logps(model, input_ids_l, attention_mask_l, is_response_token_l, average_logps)
 
             #no grad for reference model
             with torch.no_grad():
-                logps_ref_w = compute_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w)
-                logps_ref_l = compute_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l)
+                logps_ref_w = compute_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w, average_logps)
+                logps_ref_l = compute_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l, average_logps)
 
             loss, reward_margin = compute_loss(logps_w, logps_l, logps_ref_w, logps_ref_l, beta)
 
@@ -228,21 +230,21 @@ def train(
                 # log loss per step
                 wandb.log(
                     {
-                        'ipo_train_loss_step': loss_sum/gradient_accumulation_steps,
-                        'ipo_train_reward_margin_step': reward_margin_sum/gradient_accumulation_steps   ,
+                        'ipo_train_loss_step': loss_sum/max(loss_count, 1), #or loss_sum/gradient_accumulation_steps or loss_sum/max(loss_count, 1)?
+                        'ipo_train_reward_margin_step': reward_margin_sum/max(loss_count, 1),
                         'lr': scheduler.get_last_lr()[0],
                     },
                     step=global_step,
                 )
-                loss_sum = 0.0
-                reward_margin_sum = 0.0
-                loss_count = 0
+                # loss_sum = 0.0
+                # reward_margin_sum = 0.0
+                # loss_count = 0
 
                 ########## EVALUATION ##########
                 # evaluate on test dataloader every epoch or on the final epoch
                 # can change to evaluate every x gradient accumulation steps by changing the % 1 to % x
                 if (idx + 1) % 10 == 0:
-                    evaluate(model, reference_model, test_dataloader, device, beta, global_step)
+                    evaluate(model, reference_model, test_dataloader, device, beta, global_step, average_logps)
                     model.train()
 
         # NOT USING PER EPOCH LOGGING BECAUSE WE ARE LOGGING PER STEP ABOVE  
