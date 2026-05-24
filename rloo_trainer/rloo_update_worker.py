@@ -32,8 +32,8 @@ class RLOOUpdateWorker:
         gradient_accumulation_steps=1,
         gradient_clipping=1.0,
         group_size=16, 
-        entropy_coefficient=0.01, 
-        kl_divergence_coefficient=0.0, 
+        entropy_coefficient=0.05, 
+        kl_divergence_coefficient=0.02, 
         lr_schedule='constant',
         learning_rate=1e-5, 
         weight_decay=0.01, 
@@ -220,9 +220,10 @@ class RLOOUpdateWorker:
         # Convert everything to tensors since they are all numpy arrays
         input_ids_torch = torch.from_numpy(input_ids).to(device)
         attention_mask_torch = torch.from_numpy(attention_mask).to(device)
-        response_mask = torch.from_numpy(is_response_token).to(device).float()
+        response_mask = torch.from_numpy(is_response_token).to(device).float() * attention_mask_torch.float()
         rewards_torch = torch.from_numpy(rewards).to(device).float()
 
+        # Compute token log probs
         outputs = self.model(input_ids=input_ids_torch, attention_mask=attention_mask_torch)
 
         # Same logic as done in sft.py
@@ -233,10 +234,77 @@ class RLOOUpdateWorker:
         #                                [batch*group, vocab, seq len]  [batch*group, seq len] => [batch*group, seq len]
         token_log_probs = -F.cross_entropy(shifted_logits.transpose(1,2), shifted_labels, reduction='none')
 
+        # Build leave-one-out baseline
         group = self.group_size
         batch_size = rewards_torch.shape[0] // group # [batch*group]
 
         rewards_g = rewards_torch.view(batch_size, group)
         group_sum = rewards_g.sum(dim=1, keepdim=True)
         baseline = (group_sum - rewards_g) / (group - 1)
+
+        # Compute advantage
         adv = (rewards_g - baseline).view(-1)
+
+        log_probs_filt = (token_log_probs * shifted_mask).sum(dim=-1)
+
+        # Get importance weights and compute policy gradient loss
+        if sample_log_probs is not None:
+            with torch.no_grad():
+                sample_log_probs_torch = torch.from_numpy(sample_log_probs).to(device)
+                ratio = torch.exp(torch.clamp(log_probs_filt - sample_log_probs_torch, -20, 20))
+                weights = torch.clamp(ratio, max=100)
+
+            policy_loss = -(weights * log_probs_filt * adv.detach()).mean()
+        else:
+            weights = torch.ones_like(log_probs_filt)
+            policy_loss = -(log_probs_filt * adv.detach()).mean()
+        
+        # Add entropy regularization
+        token_count = shifted_mask.sum()
+        log_probs = F.log_softmax(shifted_logits, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy_token_lvl = -(probs * log_probs).sum(dim=-1)
+        entropy = (entropy_token_lvl * shifted_mask).sum() / token_count
+
+        # Add KL penalty with respect to reference model
+        if self.kl_divergence_coefficient > 0:
+            with torch.no_grad():
+                ref_out = self.ref_model(input_ids=input_ids_torch, attention_mask=attention_mask_torch)
+
+                ref_logits = ref_out.logits[:, :-1, :]
+
+                ref_token_log_probs = -F.cross_entropy(ref_logits.transpose(1,2), shifted_labels, reduction='none')
+
+            log_diff = ref_token_log_probs - token_log_probs
+            kl = ((torch.exp(log_diff) - 1.0 - log_diff) * shifted_mask).sum() / token_count
+        else:
+            kl = torch.tensor(0.0, device=device)
+
+        # Combine losses
+        ent_loss = -self.entropy_coefficient * entropy
+        kl_loss = self.kl_divergence_coefficient * kl
+
+        loss = policy_loss + ent_loss + kl_loss
+
+        # Backward pass & avg loss over gradient accumulation steps
+        (loss / self.gradient_accumulation_steps).backward()
+
+        # Take steps if it's an update step
+        if is_update_step:
+            if self.gradient_clipping > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clipping)
+            
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+        
+        # Return scalar metrics
+        metrics = {
+            'policy_gradient_loss': policy_loss.item(),
+            'entropy_loss': ent_loss.item(),
+            'kl_loss': kl_loss.item(),
+            'total_loss': loss.item(),
+            'weight_mean': weights.mean().item()
+        }
+
+        return metrics
