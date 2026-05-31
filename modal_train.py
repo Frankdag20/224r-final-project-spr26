@@ -6,6 +6,12 @@ Run from the `default_proj` directory, for example:
     modal run modal_train.py ipo --model_name your/model --dataset_name your/dataset
     modal run modal_train.py rloo --model_name your/model --dataset_name your/dataset
     modal run modal_train.py eval --model_path your/model --output_name your_eval
+
+TIR extension entrypoints (see tir_extension/ package):
+
+    modal run modal_train.py tir_gen -- --n_problems 500
+    modal run modal_train.py tir_sft -- --model_name your/model
+    modal run modal_train.py tir_rloo -- --num_training_steps 250
 """
 
 from __future__ import annotations
@@ -37,6 +43,8 @@ PIP_EXTRA_INDEX_URL = os.environ.get(
 
 TRAINING_VOLUME = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
+from dotenv import load_dotenv
+load_dotenv()   # reads .env from the project root into os.environ
 
 def _build_secret_list() -> list[modal.Secret]:
     secret_values = {}
@@ -46,6 +54,11 @@ def _build_secret_list() -> list[modal.Secret]:
         "WANDB_ENTITY",
         "WANDB_USERNAME",
         "WANDB_USER_EMAIL",
+        # Required by the TIR extension for DSPy / teacher-trajectory generation.
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "TOGETHER_API_KEY",
+        "DSPY_LM",
     ):
         value = os.environ.get(key)
         if value:
@@ -192,11 +205,55 @@ def run_eval(eval_args: list[str]) -> str:
     return _run_eval(eval_args)
 
 
+@app.function(
+    image=base_image,
+    gpu=GPU_CONFIG,
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
+def run_tir_gen_trajectories(trainer_args: list[str]) -> str:
+    return _run_training(
+        "tir_extension/sft_tir/generate_trajectories.py", trainer_args
+    )
+
+
+@app.function(
+    image=base_image,
+    gpu=GPU_CONFIG,
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
+def run_tir_sft(trainer_args: list[str]) -> str:
+    return _run_training("tir_extension/sft_tir/sft_tir.py", trainer_args)
+
+
+@app.function(
+    image=base_image,
+    gpu=GPU_CONFIG,
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
+def run_tir_rloo(trainer_args: list[str]) -> str:
+    return _run_training("tir_extension/training/rloo_tir.py", trainer_args)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Launch one of the existing training entrypoints on Modal.",
     )
-    parser.add_argument("trainer", choices=("sft", "ipo", "rloo", "eval"))
+    parser.add_argument(
+        "trainer",
+        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo"),
+    )
     parser.add_argument(
         "trainer_args",
         nargs=argparse.REMAINDER,
@@ -220,6 +277,12 @@ def main(*raw_args: str) -> None:
         result = run_ipo.remote(trainer_args)
     elif args.trainer == "eval":
         result = run_eval.remote(trainer_args)
+    elif args.trainer == "tir_gen":
+        result = run_tir_gen_trajectories.remote(trainer_args)
+    elif args.trainer == "tir_sft":
+        result = run_tir_sft.remote(trainer_args)
+    elif args.trainer == "tir_rloo":
+        result = run_tir_rloo.remote(trainer_args)
     else:
         result = run_rloo.remote(trainer_args)
 

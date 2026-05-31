@@ -43,7 +43,8 @@ dependencies = [
     "accelerate",
     "scipy",
     "seaborn",
-    "ray[data,train,tune,serve]"
+    "ray[data,train,tune,serve]",
+    "dspy-ai>=2.5",
 ]
 
 [project.optional-dependencies]
@@ -65,7 +66,7 @@ Repository = "https://github.com/asingh15/arc-clean"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["llm_wrapper*", "evaluation*", "sampling*", "dataset_generation*"]
+include = ["llm_wrapper*", "evaluation*", "sampling*", "dataset_generation*", "tir_extension*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.md"]

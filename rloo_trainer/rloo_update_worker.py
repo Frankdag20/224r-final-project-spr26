@@ -141,9 +141,17 @@ class RLOOUpdateWorker:
         is_response_token: np.ndarray,
         rewards: np.ndarray,
         sample_log_probs: Optional[np.ndarray] = None,
+        tool_result_mask: Optional[np.ndarray] = None,
         device='cuda',
     ):
-        """Split incoming batch into microbatches and call `update(...)`."""
+        """Split incoming batch into microbatches and call `update(...)`.
+
+        ``tool_result_mask`` (optional, same shape as ``input_ids``) marks
+        tokens that came from a deterministic tool execution
+        (``<tool_result>...</tool_result>``). Those tokens are excluded from
+        the policy-gradient loss and from the entropy/KL bonuses inside
+        ``update`` so we don't train the policy on its own tool outputs.
+        """
         update_metrics = None
         if self.gradient_accumulation_steps > 1:
             curr_batch_size = input_ids.shape[0]
@@ -166,7 +174,10 @@ class RLOOUpdateWorker:
                 curr_sample_log_probs = None
                 if sample_log_probs is not None:
                     curr_sample_log_probs = sample_log_probs[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
-                
+                curr_tool_result_mask = None
+                if tool_result_mask is not None:
+                    curr_tool_result_mask = tool_result_mask[i * group_per_gradient_accumulation_step:(i + 1) * group_per_gradient_accumulation_step]
+
                 is_update_step = (i == self.gradient_accumulation_steps - 1)
                 curr_update_metrics = self.update(
                     curr_input_ids,
@@ -176,6 +187,7 @@ class RLOOUpdateWorker:
                     curr_sample_log_probs,
                     is_update_step,
                     device,
+                    tool_result_mask=curr_tool_result_mask,
                 )
                 all_metrics.append(curr_update_metrics)
             update_metrics = {}
@@ -190,6 +202,7 @@ class RLOOUpdateWorker:
                 sample_log_probs,
                 True,
                 device,
+                tool_result_mask=tool_result_mask,
             )
 
         return update_metrics
@@ -205,6 +218,7 @@ class RLOOUpdateWorker:
         sample_log_probs: Optional[np.ndarray] = None,
         is_update_step: bool = True,
         device='cuda',
+        tool_result_mask: Optional[np.ndarray] = None,
     ):
         # TODO(student): implement one RLOO policy update.
         # Inputs arrive flattened as [batch_size * group_size, seq_len].
@@ -222,6 +236,19 @@ class RLOOUpdateWorker:
         attention_mask_torch = torch.from_numpy(attention_mask).to(device)
         response_mask = torch.from_numpy(is_response_token).to(device).float() * attention_mask_torch.float()
         rewards_torch = torch.from_numpy(rewards).to(device).float()
+
+        # TIR extension: exclude deterministic <tool_result>...</tool_result>
+        # tokens from the policy gradient so we never train on tokens the
+        # model didn't actually generate.
+        tool_result_fraction = 0.0
+        if tool_result_mask is not None:
+            tool_result_mask_torch = torch.from_numpy(tool_result_mask).to(device).float()
+            # Per-token "trainable" mask: response AND not tool-result.
+            response_mask = response_mask * (1.0 - tool_result_mask_torch)
+            tool_result_fraction = float(
+                tool_result_mask_torch.sum().item()
+                / max(tool_result_mask_torch.numel(), 1)
+            )
 
         # Compute token log probs
         outputs = self.model(input_ids=input_ids_torch, attention_mask=attention_mask_torch)
@@ -260,7 +287,7 @@ class RLOOUpdateWorker:
             policy_loss = -(log_probs_filt * adv.detach()).mean()
         
         # Add entropy regularization
-        token_count = shifted_mask.sum()
+        token_count = shifted_mask.sum().clamp(min=1.0)
         log_probs = F.log_softmax(shifted_logits, dim=-1)
         probs = torch.exp(log_probs)
         entropy_token_lvl = -(probs * log_probs).sum(dim=-1)
@@ -304,7 +331,8 @@ class RLOOUpdateWorker:
             'entropy_loss': ent_loss.item(),
             'kl_loss': kl_loss.item(),
             'total_loss': loss.item(),
-            'weight_mean': weights.mean().item()
+            'weight_mean': weights.mean().item(),
+            'tool_result_mask_fraction': tool_result_fraction,
         }
 
         return metrics
