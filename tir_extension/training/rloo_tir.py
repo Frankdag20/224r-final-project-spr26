@@ -47,6 +47,7 @@ from tir_extension.training.failure_aware_reward import (
     aggregate_tool_metrics,
     compute_score_with_tools,
 )
+from tir_extension.training.tir_sampling_worker import TIRSamplingWorker
 
 
 class TIRRLOOTrainer(RLOOTrainer):
@@ -67,6 +68,8 @@ class TIRRLOOTrainer(RLOOTrainer):
         initial_active_tools: str | None = None,
         max_tool_call_truncation: int = 16,
         save_failure_db_every_n_steps: int = 5,
+        multi_turn_tools: bool = True,
+        max_tool_turns: int = 5,
         # Everything else is forwarded straight to RLOOTrainer.
         **rloo_kwargs,
     ):
@@ -82,6 +85,8 @@ class TIRRLOOTrainer(RLOOTrainer):
         self.dspy_max_tokens = dspy_max_tokens
         self.max_tool_call_truncation = max_tool_call_truncation
         self.save_failure_db_every_n_steps = save_failure_db_every_n_steps
+        self.multi_turn_tools = multi_turn_tools
+        self.max_tool_turns = max_tool_turns
 
         # Bounded persistent log of failed rollouts (seeded if a baseline run
         # already wrote one to the same path).
@@ -144,6 +149,39 @@ class TIRRLOOTrainer(RLOOTrainer):
                 max_tokens=self.dspy_max_tokens,
             )
         return self._analyzer
+
+    # ------------------------------------------------------------------
+    # Multi-turn sampling worker override.
+    # ------------------------------------------------------------------
+
+    def _create_sampling_worker(self, model_path):
+        """Create a TIR sampling worker with multi-turn tool execution."""
+        if not self.multi_turn_tools:
+            # Fall back to baseline single-pass sampling
+            return super()._create_sampling_worker(model_path)
+
+        if self.update_worker is not None:
+            ray.kill(self.update_worker)
+            self.update_worker = None
+
+        self.sampling_worker = TIRSamplingWorker.remote(
+            model_path=model_path,
+            max_model_len=self.max_model_len,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            enable_chunked_prefill=self.enable_chunked_prefill,
+            max_num_seqs=self.max_num_seqs,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            max_tokens=self.max_tokens,
+            group_size=self.group_size,
+            max_tool_turns=self.max_tool_turns,
+            active_tools=set(self.tool_selector.active_tools),
+        )
+        ray.get(self.sampling_worker.load_checkpoint.remote())
+        return self.sampling_worker
 
     # ------------------------------------------------------------------
     # Tokenization with tool-result mask.
@@ -288,17 +326,22 @@ class TIRRLOOTrainer(RLOOTrainer):
 
                 # ----- 2) Tool execution -----
                 active_tools = set(self.tool_selector.active_tools)
-                all_responses: list[list[str]] = []
-                for raw_group in all_raw_responses:
-                    materialised = [
-                        execute_tool_calls(
-                            response,
-                            active_tools=active_tools,
-                            max_calls=self.max_tool_call_truncation,
-                        )
-                        for response in raw_group
-                    ]
-                    all_responses.append(materialised)
+                if self.multi_turn_tools:
+                    # Tools already executed during multi-turn sampling
+                    all_responses = all_raw_responses
+                else:
+                    # Post-hoc tool execution (single-pass fallback)
+                    all_responses: list[list[str]] = []
+                    for raw_group in all_raw_responses:
+                        materialised = [
+                            execute_tool_calls(
+                                response,
+                                active_tools=active_tools,
+                                max_calls=self.max_tool_call_truncation,
+                            )
+                            for response in raw_group
+                        ]
+                        all_responses.append(materialised)
 
                 # ----- 3) Tool-aware rewards -----
                 all_rewards: list[list[float]] = []
@@ -550,6 +593,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated subset of tool names. Defaults to all relevant.")
     parser.add_argument("--max_tool_call_truncation", type=int, default=16)
     parser.add_argument("--save_failure_db_every_n_steps", type=int, default=5)
+    parser.add_argument("--multi_turn_tools", action="store_true", default=True,
+                        help="Use multi-turn tool execution during sampling (default).")
+    parser.add_argument("--no_multi_turn_tools", action="store_true",
+                        help="Disable multi-turn; use post-hoc tool execution.")
+    parser.add_argument("--max_tool_turns", type=int, default=5)
     return parser
 
 
@@ -579,6 +627,8 @@ def main():
         "initial_active_tools": args.initial_active_tools,
         "max_tool_call_truncation": args.max_tool_call_truncation,
         "save_failure_db_every_n_steps": args.save_failure_db_every_n_steps,
+        "multi_turn_tools": not args.no_multi_turn_tools,
+        "max_tool_turns": args.max_tool_turns,
     }
     rloo_kwargs = dict(
         model_name=args.model_name,

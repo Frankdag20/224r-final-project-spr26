@@ -246,13 +246,49 @@ def run_tir_rloo(trainer_args: list[str]) -> str:
     return _run_training("tir_extension/training/rloo_tir.py", trainer_args)
 
 
+@app.function(
+    image=base_image,
+    gpu=GPU_CONFIG,
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
+def run_eval_tir(eval_args: list[str]) -> str:
+    return _run_eval_script("evaluation/countdown_eval_tir.py", eval_args)
+
+
+def _run_eval_script(script_path: str, eval_args: list[str]) -> str:
+    REMOTE_VOLUME_ROOT.mkdir(parents=True, exist_ok=True)
+    (REMOTE_VOLUME_ROOT / "cache" / "huggingface" / "datasets").mkdir(parents=True, exist_ok=True)
+    (REMOTE_VOLUME_ROOT / "evaluation" / "eval_results").mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    hf_home = REMOTE_VOLUME_ROOT / "cache" / "huggingface"
+    env.setdefault("HF_HOME", str(hf_home))
+    env.setdefault("HF_DATASETS_CACHE", str(hf_home / "datasets"))
+    env.setdefault("WANDB__SERVICE_WAIT", "300")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    command = ["python", script_path, *eval_args]
+    print(f"Executing command in Modal: {shlex.join(command)}")
+
+    try:
+        subprocess.run(command, cwd=str(REMOTE_PROJECT_ROOT), env=env, check=True)
+    finally:
+        TRAINING_VOLUME.commit()
+
+    return "Finished TIR evaluation run and persisted results to the Modal volume."
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Launch one of the existing training entrypoints on Modal.",
     )
     parser.add_argument(
         "trainer",
-        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo"),
+        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo", "eval_tir"),
     )
     parser.add_argument(
         "trainer_args",
@@ -283,6 +319,8 @@ def main(*raw_args: str) -> None:
         result = run_tir_sft.remote(trainer_args)
     elif args.trainer == "tir_rloo":
         result = run_tir_rloo.remote(trainer_args)
+    elif args.trainer == "eval_tir":
+        result = run_eval_tir.remote(trainer_args)
     else:
         result = run_rloo.remote(trainer_args)
 
