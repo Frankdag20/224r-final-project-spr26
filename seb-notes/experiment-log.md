@@ -24,12 +24,31 @@
   - Runtime: ~7 minutes with 32 workers
   - Output: `tir_trajectories_2000.json`
 
-## Run 3 (planned): Generate Tool-Use Trajectories — calculator-only (2000 problems)
+## Run 3: Generate Tool-Use Trajectories — calculator-only (2000 problems)
+- **Date**: 2026-06-01
 - **Command**: `uv run python tir_extension/sft_tir/generate_trajectories.py --n_problems 2000 --output_path tir_trajectories_calc_only.json --max_workers 32 --active_tools calculator --teacher_model deepseek-chat`
 - **Teacher model**: deepseek-chat
 - **Active tools**: calculator only (matches literature — Tool-Star, Understanding TIR)
-- **Rationale**: number_tracker and running_total don't add real computational value. Cleaner baseline.
-- **Status**: PENDING (after Run 2 finishes)
+- **Status**: COMPLETE
+- **Result**: 1699 trajectories, all score=1.0, calculator only (1823 calls)
+  - Output: `tir_trajectories_calc_only.json`
+
+## Run 4 (planned): TIR SFT — calculator-only, from vanilla SFT checkpoint
+- **Script**: `bash tir_extension/scripts/02_sft_tir_experiments.sh exp1`
+- **Base model**: `asingh15/qwen-sft-countdown-defaultproj` (vanilla SFT checkpoint)
+- **Dataset**: `tir_trajectories_calc_only.json` (1699 trajectories)
+- **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048
+- **Rationale**: Comparable to Mahmood's run but with calculator-only data (1699 vs 414 trajectories)
+- **Eval plan**: Evaluate BOTH with and without tools (Mahmood only eval'd without tools)
+- **Status**: PENDING
+
+## Run 5 (planned): TIR SFT — calculator-only, from base Qwen (cold start)
+- **Script**: `bash tir_extension/scripts/02_sft_tir_experiments.sh exp2`
+- **Base model**: `Qwen/Qwen2.5-0.5B` (pretrained, no prior SFT)
+- **Dataset**: `tir_trajectories_calc_only.json` (1699 trajectories)
+- **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048
+- **Rationale**: Clean cold-start experiment matching Tool-Star literature. Tests whether tool-use SFT alone is sufficient without prior task SFT.
+- **Status**: PENDING
 
 ---
 
