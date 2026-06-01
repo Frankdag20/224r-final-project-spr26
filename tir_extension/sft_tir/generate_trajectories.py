@@ -148,6 +148,7 @@ def generate_one(
     attempt = 0
     rate_limit_retries = 0
     max_rate_limit_retries = 20
+    fail_reason = "unknown"
     while attempt < max_attempts:
         try:
             raw = call_teacher(
@@ -164,7 +165,7 @@ def generate_one(
                 rate_limit_retries += 1
                 time.sleep(2 + rate_limit_retries * 0.5)
                 continue  # don't count as an attempt
-            print(f"  teacher call failed (attempt {attempt+1}): {exc}", flush=True)
+            fail_reason = "rate_limit_exhausted" if is_rate_limit else "api_error"
             attempt += 1
             time.sleep(2 ** attempt)
             continue
@@ -172,10 +173,7 @@ def generate_one(
 
         # Gate: if the model produced no tool calls and we require them, retry.
         if require_tool_use and not parse_tool_calls(raw):
-            print(
-                f"  attempt {attempt+1}: no <use_tool> found — retrying",
-                flush=True,
-            )
+            fail_reason = "no_tool_use"
             continue
 
         # Deterministically materialise any <tool_result> spans the teacher
@@ -196,6 +194,9 @@ def generate_one(
             return record
         if keep_format_score and score > 0 and best_record is None:
             best_record = record
+        fail_reason = "wrong_answer"
+    if best_record is None:
+        return {"_failed": True, "_reason": fail_reason}
     return best_record
 
 
@@ -278,6 +279,7 @@ def main():
     tool_use_count = 0
     completed = 0
     failed = 0
+    fail_reasons: dict[str, int] = {}
 
     def _process(prompt, ground_truth):
         return generate_one(
@@ -295,6 +297,7 @@ def main():
         )
 
     print(f"Running with {args.max_workers} parallel workers", flush=True)
+    t_start = time.time()
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = {
             executor.submit(_process, prompt, gt): i
@@ -303,7 +306,7 @@ def main():
         for future in as_completed(futures):
             completed += 1
             record = future.result()
-            if record is not None:
+            if record is not None and not record.get("_failed"):
                 if record.get("num_tool_calls", 0) > 0:
                     tool_use_count += 1
                 records.append(record)
@@ -313,10 +316,16 @@ def main():
                     partials += 1
             else:
                 failed += 1
+                reason = record.get("_reason", "unknown") if record else "exception"
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
             if completed % 50 == 0:
+                elapsed = time.time() - t_start
+                rate = completed / elapsed
+                remaining = (len(all_inputs) - completed) / rate if rate > 0 else 0
                 print(
                     f"[{completed}/{len(all_inputs)}] kept={len(records)} "
-                    f"(full={successes}, partial={partials}, FAILED={failed}) | tool_use={tool_use_count}",
+                    f"(full={successes}, partial={partials}, FAILED={failed} {fail_reasons}) | tool_use={tool_use_count} "
+                    f"| {elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining",
                     flush=True,
                 )
 
