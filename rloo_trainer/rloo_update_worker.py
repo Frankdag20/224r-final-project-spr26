@@ -143,6 +143,7 @@ class RLOOUpdateWorker:
         sample_log_probs: Optional[np.ndarray] = None,
         tool_result_mask: Optional[np.ndarray] = None,
         device='cuda',
+        group_size_override: Optional[int] = None,
     ):
         """Split incoming batch into microbatches and call `update(...)`.
 
@@ -152,6 +153,7 @@ class RLOOUpdateWorker:
         the policy-gradient loss and from the entropy/KL bonuses inside
         ``update`` so we don't train the policy on its own tool outputs.
         """
+        effective_group = group_size_override if group_size_override is not None else self.group_size
         update_metrics = None
         if self.gradient_accumulation_steps > 1:
             curr_batch_size = input_ids.shape[0]
@@ -160,9 +162,8 @@ class RLOOUpdateWorker:
                 f"{self.gradient_accumulation_steps}."
             )
             group_per_gradient_accumulation_step = curr_batch_size // self.gradient_accumulation_steps
-            # Ensure each microbatch still contains full RLOO groups so the baseline is meaningful
-            assert group_per_gradient_accumulation_step % self.group_size == 0, (
-                f"Microbatch size {group_per_gradient_accumulation_step} must be divisible by group_size {self.group_size} "
+            assert group_per_gradient_accumulation_step % effective_group == 0, (
+                f"Microbatch size {group_per_gradient_accumulation_step} must be divisible by group_size {effective_group} "
                 f"when using gradient_accumulation_steps={self.gradient_accumulation_steps}."
             )
             all_metrics = []
@@ -188,6 +189,7 @@ class RLOOUpdateWorker:
                     is_update_step,
                     device,
                     tool_result_mask=curr_tool_result_mask,
+                    group_size_override=effective_group,
                 )
                 all_metrics.append(curr_update_metrics)
             update_metrics = {}
@@ -203,6 +205,7 @@ class RLOOUpdateWorker:
                 True,
                 device,
                 tool_result_mask=tool_result_mask,
+                group_size_override=effective_group,
             )
 
         return update_metrics
@@ -219,6 +222,7 @@ class RLOOUpdateWorker:
         is_update_step: bool = True,
         device='cuda',
         tool_result_mask: Optional[np.ndarray] = None,
+        group_size_override: Optional[int] = None,
     ):
         # TODO(student): implement one RLOO policy update.
         # Inputs arrive flattened as [batch_size * group_size, seq_len].
@@ -262,7 +266,7 @@ class RLOOUpdateWorker:
         token_log_probs = -F.cross_entropy(shifted_logits.transpose(1,2), shifted_labels, reduction='none')
 
         # Build leave-one-out baseline
-        group = self.group_size
+        group = group_size_override if group_size_override is not None else self.group_size
         batch_size = rewards_torch.shape[0] // group # [batch*group]
 
         rewards_g = rewards_torch.view(batch_size, group)

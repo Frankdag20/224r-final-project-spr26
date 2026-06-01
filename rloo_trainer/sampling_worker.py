@@ -151,9 +151,35 @@ class SamplingWorker:
 
         return float(seq_logprob)
 
-    def generate(self, prompts: list[str]) -> tuple[list[list[str]], list[list[float]]]:
-        """Sample `group_size` responses per prompt and return sequence logprobs."""
-        outputs = self.llm.generate(prompts, self.sampling_params)
+    def generate(
+        self,
+        prompts: list[str],
+        n: int | None = None,
+    ) -> tuple[list[list[str]], list[list[float]]]:
+        """Sample responses per prompt and return sequence logprobs.
+
+        Args:
+            prompts: Input prompt strings.
+            n: Number of responses per prompt. Defaults to ``self.group_size``.
+               Pass a larger value for the self-critic phase to get more
+               diverse rollouts without restarting the worker.
+        """
+        if n is None or n == self.group_size:
+            sampling_params = self.sampling_params
+        else:
+            from vllm import SamplingParams as _SP
+            sampling_params = _SP(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                max_tokens=self.max_tokens,
+                n=n,
+                stop=["</answer>"],
+                include_stop_str_in_output=True,
+                logprobs=1,
+            )
+        outputs = self.llm.generate(prompts, sampling_params)
         all_responses = []
         all_logprobs = []
         for output in outputs:

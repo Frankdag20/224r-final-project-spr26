@@ -149,8 +149,15 @@ class TIRRLOOTrainer(RLOOTrainer):
     # Tokenization with tool-result mask.
     # ------------------------------------------------------------------
 
-    def tokenize_batch_tir(self, batch: dict) -> dict[str, np.ndarray]:
+    def tokenize_batch_tir(
+        self, batch: dict, group_size_override: int | None = None
+    ) -> dict[str, np.ndarray]:
         """Same flattening as ``tokenize_batch`` plus a tool-result token mask.
+
+        Args:
+            batch: dict with prompt/response/rewards/sample_log_probs lists.
+            group_size_override: number of responses per prompt when different
+                from ``self.group_size`` (e.g. during the self-critic phase).
 
         Returns the standard tokenized fields and an additional
         ``tool_result_mask`` array shaped ``[batch*group, seq_len]`` with 1
@@ -158,12 +165,14 @@ class TIRRLOOTrainer(RLOOTrainer):
         ``<tool_result>...</tool_result>`` span (always within the response
         portion).
         """
+        n = group_size_override if group_size_override is not None else self.group_size
+
         all_prompts = batch["prompt"]
         all_responses = batch["response"]
         all_rewards = batch["rewards"]
         all_sample_log_probs = batch["sample_log_probs"]
 
-        prompts_repeated = [item for item in all_prompts for _ in range(self.group_size)]
+        prompts_repeated = [item for item in all_prompts for _ in range(n)]
         responses_flat = [item for sublist in all_responses for item in sublist]
         rewards_flat = [item for sublist in all_rewards for item in sublist]
         sample_lp_flat = [item for sublist in all_sample_log_probs for item in sublist]
