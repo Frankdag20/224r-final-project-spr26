@@ -145,7 +145,10 @@ def generate_one(
     before we accept its solution as a training example.
     """
     best_record = None
-    for attempt in range(max_attempts):
+    attempt = 0
+    rate_limit_retries = 0
+    max_rate_limit_retries = 20
+    while attempt < max_attempts:
         try:
             raw = call_teacher(
                 client,
@@ -156,9 +159,16 @@ def generate_one(
                 temperature=temperature,
             )
         except Exception as exc:  # noqa: BLE001 - external API
+            is_rate_limit = "rate_limit" in str(exc).lower() or "429" in str(exc)
+            if is_rate_limit and rate_limit_retries < max_rate_limit_retries:
+                rate_limit_retries += 1
+                time.sleep(2 + rate_limit_retries * 0.5)
+                continue  # don't count as an attempt
             print(f"  teacher call failed (attempt {attempt+1}): {exc}", flush=True)
+            attempt += 1
             time.sleep(2 ** attempt)
             continue
+        attempt += 1
 
         # Gate: if the model produced no tool calls and we require them, retry.
         if require_tool_use and not parse_tool_calls(raw):
@@ -227,6 +237,8 @@ def main():
     parser.add_argument("--active_tools", type=str, default="",
                         help="Comma-separated subset of tool names. Defaults to all relevant tools.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_workers", type=int, default=16,
+                        help="Number of parallel API calls.")
     args = parser.parse_args()
 
     if args.active_tools.strip():
@@ -248,21 +260,27 @@ def main():
 
     # Imported here so the file can still be imported on environments without
     # the OpenAI client (e.g. the trainer process).
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     from openai import OpenAI
 
     client = OpenAI()
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    all_inputs = list(iterate_prompts(args.dataset_name, args.split, args.n_problems, args.seed))
     records: list[dict] = []
     successes = 0
     partials = 0
-    tool_use_count = 0  # problems attempted so far that had at least one tool call
-    attempted = 0
+    tool_use_count = 0
+    completed = 0
+    failed = 0
 
-    for i, (prompt, ground_truth) in enumerate(
-        iterate_prompts(args.dataset_name, args.split, args.n_problems, args.seed)
-    ):
-        attempted += 1
-        record = generate_one(
+    def _process(prompt, ground_truth):
+        return generate_one(
             client=client,
             model=args.teacher_model,
             system_prompt=system_prompt,
@@ -275,32 +293,32 @@ def main():
             keep_format_score=args.keep_format_score,
             require_tool_use=args.require_tool_use,
         )
-        if record is None:
-            if (i + 1) % 10 == 0:
-                tool_use_rate = f"{tool_use_count}/{attempted}"
+
+    print(f"Running with {args.max_workers} parallel workers", flush=True)
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        futures = {
+            executor.submit(_process, prompt, gt): i
+            for i, (prompt, gt) in enumerate(all_inputs)
+        }
+        for future in as_completed(futures):
+            completed += 1
+            record = future.result()
+            if record is not None:
+                if record.get("num_tool_calls", 0) > 0:
+                    tool_use_count += 1
+                records.append(record)
+                if record["score"] >= 1.0:
+                    successes += 1
+                else:
+                    partials += 1
+            else:
+                failed += 1
+            if completed % 50 == 0:
                 print(
-                    f"[{i+1}] kept={len(records)} (full={successes}, partial={partials})"
-                    f" | tool_use={tool_use_rate}",
+                    f"[{completed}/{len(all_inputs)}] kept={len(records)} "
+                    f"(full={successes}, partial={partials}, FAILED={failed}) | tool_use={tool_use_count}",
                     flush=True,
                 )
-            continue
-
-        if record.get("num_tool_calls", 0) > 0:
-            tool_use_count += 1
-
-        records.append(record)
-        if record["score"] >= 1.0:
-            successes += 1
-        else:
-            partials += 1
-
-        if (i + 1) % 10 == 0:
-            tool_use_rate = f"{tool_use_count}/{attempted}"
-            print(
-                f"[{i+1}] kept={len(records)} (full={successes}, partial={partials})"
-                f" | tool_use={tool_use_rate}",
-                flush=True,
-            )
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     with open(args.output_path, "w") as fh:

@@ -43,8 +43,11 @@ PIP_EXTRA_INDEX_URL = os.environ.get(
 
 TRAINING_VOLUME = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-from dotenv import load_dotenv
-load_dotenv()   # reads .env from the project root into os.environ
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 def _build_secret_list() -> list[modal.Secret]:
     secret_values = {}

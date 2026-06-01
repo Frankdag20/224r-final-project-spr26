@@ -6,6 +6,7 @@ Reward design:
 - score (default 1.0) for valid equations hitting target exactly.
 """
 
+import os
 import re
 import random
 import ast
@@ -71,7 +72,7 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
     
     equation = extract_solution(solution_str=solution_str)
     # Sparse debug logging helps inspect occasional failures without flooding logs.
-    do_print = random.randint(1, 64) == 1
+    do_print = os.environ.get("COUNTDOWN_DEBUG") == "1" and random.randint(1, 64) == 1
     
     if do_print:
         print(f"--------------------------------")
