@@ -9,9 +9,18 @@ Add tool-integrated reasoning (TIR) to the Countdown RLOO pipeline, following th
 - **Script**: `bash tir_extension/scripts/01_generate_trajectories.sh`
 - Uses gpt-4o-mini via OpenAI API to solve Countdown problems with `<use_tool>` calls
 - Same prompts from `asingh15/countdown_tasks_3to4`, just new completions with tool use
-- Filters for correctness (score=1.0), targets ~500 examples
-- Output: `/vol/checkpoints/tir_trajectories.json` on Modal volume
+- Filters for correctness (score=1.0)
 - Requires `OPENAI_API_KEY` env var
+
+**Two dataset variants (for ablation):**
+1. **3-tool** (calculator + number_tracker + running_total): 2000 problems → ~1200 trajectories
+   - `tir_trajectories_2000.json` — currently generating
+   - Also have Mahmood's `tir_trajectories.json` (414 trajectories) as backup
+2. **Calculator-only** (cleaner, matches literature): 2000 problems → run after 3-tool finishes
+   - `tir_trajectories_calc_only.json`
+   - `--active_tools calculator`
+   - Literature (Tool-Star, Understanding TIR) uses single tool per task type
+   - number_tracker and running_total don't add real computational value
 
 ### Stage 2: Cold-Start SFT on Tool-Use Trajectories
 - **Script**: `bash tir_extension/scripts/02_sft_tir.sh`
@@ -77,7 +86,14 @@ modal volume get default-proj-training evaluation/eval_results ./eval_results
 - Self-critic GRPO (`rloo_self_critic.py`)
 - Hierarchical reward (`hierarchical_reward.py`)
 
+## Experiment Plan
+1. Generate 3-tool trajectories (running now) → `tir_trajectories_2000.json`
+2. Generate calculator-only trajectories → `tir_trajectories_calc_only.json`
+3. SFT on calculator-only dataset (primary experiment, matches literature)
+4. SFT on 3-tool dataset (ablation: does adding extra tools help or hurt?)
+5. RLOO from best SFT checkpoint
+6. Compare: calculator-only vs 3-tool vs baseline (no tools)
+
 ## Open Questions
-- Do we need all 3 relevant tools or just calculator?
 - How much does multi-turn vs post-hoc actually matter for Countdown?
 - Should we start SFT from base Qwen or from the vanilla SFT checkpoint?

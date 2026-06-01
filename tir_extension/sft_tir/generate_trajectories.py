@@ -163,7 +163,9 @@ def generate_one(
             is_rate_limit = "rate_limit" in str(exc).lower() or "429" in str(exc)
             if is_rate_limit and rate_limit_retries < max_rate_limit_retries:
                 rate_limit_retries += 1
-                time.sleep(2 + rate_limit_retries * 0.5)
+                sleep_time = 2 + rate_limit_retries * 0.5
+                print(f"  [rate limit] retry {rate_limit_retries}/{max_rate_limit_retries}, sleeping {sleep_time:.1f}s", flush=True)
+                time.sleep(sleep_time)
                 continue  # don't count as an attempt
             fail_reason = "rate_limit_exhausted" if is_rate_limit else "api_error"
             attempt += 1
@@ -269,6 +271,19 @@ def main():
     from openai import OpenAI
 
     client = OpenAI()
+
+    # Verify API connection before launching all workers.
+    print(f"Testing API connection (model={args.teacher_model}, base_url={client.base_url})...", flush=True)
+    try:
+        test_resp = client.chat.completions.create(
+            model=args.teacher_model,
+            messages=[{"role": "user", "content": "Say hi"}],
+            max_tokens=5,
+        )
+        print(f"API connection OK: got '{test_resp.choices[0].message.content}'", flush=True)
+    except Exception as exc:
+        print(f"ERROR: API connection failed: {exc}", flush=True)
+        sys.exit(1)
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
