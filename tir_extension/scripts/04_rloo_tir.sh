@@ -1,21 +1,25 @@
 #!/bin/bash
-# Stage 3: RLOO with multi-turn tool-integrated reasoning.
+# Stage 3: RLOO with hierarchical reward + optional DPO self-critic.
+#
+# Usage:
+#   source .env && bash tir_extension/scripts/04_rloo_tir.sh phase1          # vanilla RLOO + hierarchical reward
+#   source .env && bash tir_extension/scripts/04_rloo_tir.sh phase2          # RLOO + hierarchical reward + DPO self-critic
+#   source .env && bash tir_extension/scripts/04_rloo_tir.sh both            # launch both in parallel on Modal
 #
 # Prerequisites:
-#   - Stage 2 completed (TIR SFT checkpoint on Modal volume)
-#   export WANDB_API_KEY=...
-#   export HF_TOKEN=...
+#   source .env  (needs WANDB_API_KEY, HF_TOKEN)
+#   TIR SFT checkpoint available on Modal volume
 
 set -euo pipefail
 
-export WANDB__SERVICE_WAIT="${WANDB__SERVICE_WAIT:-300}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Point this at the TIR SFT checkpoint
-MODEL_NAME="${MODEL_NAME:-/vol/checkpoints/tir_sft_checkpoints/tir_sft_project/tir_sft_lr5e-5_ep6/model}"
+# Best v2 SFT checkpoint — uses HF repo (volume path may not persist)
+MODEL_NAME="${MODEL_NAME:-sbfisher/tir-sft-3tool_from_sft}"
 DATASET_NAME="${DATASET_NAME:-asingh15/countdown_tasks_3to4}"
 SAVE_DIR="${SAVE_DIR:-/vol/checkpoints/tir_rloo_checkpoints}"
 WANDB_PROJECT="${WANDB_PROJECT:-tir_rloo_project}"
-WANDB_NAME="${WANDB_NAME:-tir_rloo_multi_turn}"
 
 NUM_STEPS="${NUM_STEPS:-250}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -24,28 +28,69 @@ LR="${LR:-1e-5}"
 ENTROPY="${ENTROPY:-0.01}"
 KL="${KL:-0.0}"
 MAX_TOOL_TURNS="${MAX_TOOL_TURNS:-5}"
+ACTIVE_TOOLS="${ACTIVE_TOOLS:-calculator,number_tracker,running_total}"
 
-echo "=== Stage 3: TIR RLOO with multi-turn tool execution ==="
-echo "Model: ${MODEL_NAME}"
-echo "Steps: ${NUM_STEPS}, Group: ${GROUP_SIZE}, LR: ${LR}"
+PHASE="${1:-both}"
 
-modal run modal_train.py tir_rloo -- \
-    --model_name "$MODEL_NAME" \
-    --dataset_name "$DATASET_NAME" \
-    --save_dir "$SAVE_DIR" \
-    --wandb_project "$WANDB_PROJECT" \
-    --wandb_name "$WANDB_NAME" \
-    --num_training_steps "$NUM_STEPS" \
-    --batch_size "$BATCH_SIZE" \
-    --group_size "$GROUP_SIZE" \
-    --learning_rate "$LR" \
-    --warmup_ratio 0.0 \
-    --entropy_coefficient "$ENTROPY" \
-    --kl_divergence_coefficient "$KL" \
-    --max_tool_turns "$MAX_TOOL_TURNS" \
-    --multi_turn_tools \
-    --reanalyze_every_n_steps 0 \
-    --save_every_n_steps 50 \
-    --enable_chunked_prefill
+run_phase1() {
+    echo "=== Phase 1: RLOO + Hierarchical Reward (no self-critic) ==="
+    MODAL_APP_NAME="rloo-phase1" \
+    modal run --detach "$PROJECT_ROOT/modal_train.py" tir_rloo -- \
+        --model_name "$MODEL_NAME" \
+        --dataset_name "$DATASET_NAME" \
+        --save_dir "$SAVE_DIR" \
+        --wandb_project "$WANDB_PROJECT" \
+        --wandb_name "phase1_hier_reward" \
+        --num_training_steps "$NUM_STEPS" \
+        --batch_size "$BATCH_SIZE" \
+        --group_size "$GROUP_SIZE" \
+        --learning_rate "$LR" \
+        --warmup_ratio 0.0 \
+        --entropy_coefficient "$ENTROPY" \
+        --kl_divergence_coefficient "$KL" \
+        --max_tool_turns "$MAX_TOOL_TURNS" \
+        --initial_active_tools "$ACTIVE_TOOLS" \
+        --save_every_n_steps 50 \
+        --enable_chunked_prefill &
+}
 
-echo "=== Done. Checkpoints at ${SAVE_DIR}/ ==="
+run_phase2() {
+    echo "=== Phase 2: RLOO + Hierarchical Reward + DPO Self-Critic ==="
+    MODAL_APP_NAME="rloo-phase2" \
+    modal run --detach "$PROJECT_ROOT/modal_train.py" tir_rloo -- \
+        --model_name "$MODEL_NAME" \
+        --dataset_name "$DATASET_NAME" \
+        --save_dir "$SAVE_DIR" \
+        --wandb_project "$WANDB_PROJECT" \
+        --wandb_name "phase2_self_critic" \
+        --num_training_steps "$NUM_STEPS" \
+        --batch_size "$BATCH_SIZE" \
+        --group_size "$GROUP_SIZE" \
+        --learning_rate "$LR" \
+        --warmup_ratio 0.0 \
+        --entropy_coefficient "$ENTROPY" \
+        --kl_divergence_coefficient "$KL" \
+        --max_tool_turns "$MAX_TOOL_TURNS" \
+        --initial_active_tools "$ACTIVE_TOOLS" \
+        --save_every_n_steps 50 \
+        --enable_chunked_prefill \
+        --self_critic \
+        --self_critic_every_k 5 \
+        --self_critic_n_samples 8 \
+        --self_critic_beta 0.1 &
+}
+
+case "$PHASE" in
+    phase1) run_phase1 ;;
+    phase2) run_phase2 ;;
+    both)
+        run_phase1
+        run_phase2
+        ;;
+    *) echo "Usage: $0 [phase1|phase2|both]"; exit 1 ;;
+esac
+
+wait
+echo ""
+echo "All RLOO runs submitted to Modal."
+echo "Monitor at https://modal.com"

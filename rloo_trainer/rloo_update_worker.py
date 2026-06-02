@@ -70,6 +70,8 @@ class RLOOUpdateWorker:
             del self.model
         if hasattr(self, 'ref_model'):
             del self.ref_model
+        if hasattr(self, '_dpo_ref_model'):
+            del self._dpo_ref_model
         if hasattr(self, 'optimizer'):
             del self.optimizer
         if hasattr(self, 'scheduler'):
@@ -340,3 +342,113 @@ class RLOOUpdateWorker:
         }
 
         return metrics
+
+    # ------------------------------------------------------------------
+    # DPO self-critic update (Tool-Star Algorithm 1, eq. 5)
+    # ------------------------------------------------------------------
+
+    def dpo_update(
+        self,
+        chosen_input_ids: np.ndarray,
+        chosen_attention_mask: np.ndarray,
+        chosen_is_response_token: np.ndarray,
+        rejected_input_ids: np.ndarray,
+        rejected_attention_mask: np.ndarray,
+        rejected_is_response_token: np.ndarray,
+        chosen_tool_result_mask: Optional[np.ndarray] = None,
+        rejected_tool_result_mask: Optional[np.ndarray] = None,
+        beta: float = 0.1,
+        device: str = 'cuda',
+    ) -> dict:
+        """Run one DPO update on preference pairs (self-critic phase).
+
+        Implements DPO loss from Tool-Star eq. 5:
+            L_DPO = -log sigma(beta * (log pi(y_w|x) - log pi(y_l|x)
+                                     - log pi_ref(y_w|x) + log pi_ref(y_l|x)))
+
+        Args:
+            chosen/rejected_*: Tokenized preferred/dispreferred sequences.
+            beta: DPO temperature parameter.
+        """
+        def _seq_logprob(input_ids_np, attention_mask_np, response_mask_np,
+                         tool_mask_np, model):
+            ids = torch.from_numpy(input_ids_np).to(device)
+            attn = torch.from_numpy(attention_mask_np).to(device)
+            rmask = torch.from_numpy(response_mask_np).to(device).float() * attn.float()
+            if tool_mask_np is not None:
+                tmask = torch.from_numpy(tool_mask_np).to(device).float()
+                rmask = rmask * (1.0 - tmask)
+            out = model(input_ids=ids, attention_mask=attn)
+            shifted_logits = out.logits[:, :-1, :]
+            shifted_labels = ids[:, 1:]
+            shifted_mask = rmask[:, 1:]
+            token_lp = -F.cross_entropy(
+                shifted_logits.transpose(1, 2), shifted_labels, reduction='none'
+            )
+            return (token_lp * shifted_mask).sum(dim=-1)  # [batch]
+
+        # Policy log-probs
+        pi_chosen = _seq_logprob(
+            chosen_input_ids, chosen_attention_mask,
+            chosen_is_response_token, chosen_tool_result_mask, self.model,
+        )
+        pi_rejected = _seq_logprob(
+            rejected_input_ids, rejected_attention_mask,
+            rejected_is_response_token, rejected_tool_result_mask, self.model,
+        )
+
+        # Reference log-probs (no grad).
+        # Per Tool-Star eq. 5: π_ref is the RL-initialized model, fixed
+        # throughout training.  When kl_divergence_coefficient > 0 the worker
+        # already loads a frozen ref_model.  Otherwise we snapshot the
+        # *current* policy weights as a frozen copy so the DPO baseline is
+        # meaningful (using self.model would give ref == policy → loss = log2).
+        with torch.no_grad():
+            if hasattr(self, 'ref_model'):
+                ref_model = self.ref_model
+            else:
+                # Lazy-create a frozen snapshot on first DPO call
+                if not hasattr(self, '_dpo_ref_model'):
+                    import copy
+                    self._dpo_ref_model = copy.deepcopy(self.model)
+                    self._dpo_ref_model.eval()
+                    for p in self._dpo_ref_model.parameters():
+                        p.requires_grad = False
+                ref_model = self._dpo_ref_model
+            ref_chosen = _seq_logprob(
+                chosen_input_ids, chosen_attention_mask,
+                chosen_is_response_token, chosen_tool_result_mask, ref_model,
+            )
+            ref_rejected = _seq_logprob(
+                rejected_input_ids, rejected_attention_mask,
+                rejected_is_response_token, rejected_tool_result_mask, ref_model,
+            )
+
+        # DPO loss: -log sigma(beta * ((pi_w - ref_w) - (pi_l - ref_l)))
+        logits = beta * (
+            (pi_chosen - ref_chosen) - (pi_rejected - ref_rejected)
+        )
+        dpo_loss = -F.logsigmoid(logits).mean()
+
+        dpo_loss.backward()
+
+        if self.gradient_clipping > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=self.gradient_clipping
+            )
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+
+        with torch.no_grad():
+            chosen_rewards = beta * (pi_chosen - ref_chosen)
+            rejected_rewards = beta * (pi_rejected - ref_rejected)
+            reward_margin = (chosen_rewards - rejected_rewards).mean().item()
+            accuracy = (logits > 0).float().mean().item()
+
+        return {
+            'dpo_loss': dpo_loss.item(),
+            'dpo_reward_margin': reward_margin,
+            'dpo_accuracy': accuracy,
+            'dpo_n_pairs': chosen_input_ids.shape[0],
+        }

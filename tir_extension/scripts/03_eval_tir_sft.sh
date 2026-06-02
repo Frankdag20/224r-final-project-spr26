@@ -13,7 +13,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-CHECKPOINT_BASE="${CHECKPOINT_BASE:-/vol/checkpoints/tir_sft_checkpoints/tir_sft_project_v2}"
+HF_USER="${HF_USER:-sbfisher}"
+# Use HF repos by default (v2 models were pushed to HF).
+# Override with CHECKPOINT_BASE to use local volume paths instead.
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-}"
 EVAL_DATASET="${EVAL_DATASET:-asingh15/countdown_tasks_3to4}"
 OUTPUT_DIR="${OUTPUT_DIR:-/vol/evaluation/eval_results}"
 
@@ -31,7 +34,11 @@ else
 fi
 
 for run in "${RUNS[@]}"; do
-    model_path="${CHECKPOINT_BASE}/${run}/model"
+    if [[ -n "$CHECKPOINT_BASE" ]]; then
+        model_path="${CHECKPOINT_BASE}/${run}/model"
+    else
+        model_path="${HF_USER}/tir-sft-${run}"
+    fi
 
     # Determine active tools based on run name
     tools_flag=""
@@ -45,7 +52,7 @@ for run in "${RUNS[@]}"; do
         --model_path "$model_path" \
         --eval_dataset "$EVAL_DATASET" \
         --output_dir "$OUTPUT_DIR" \
-        --output_name "${run}_with_tools" \
+        --output_name "${run}_v2_with_tools" \
         $tools_flag &
 
     echo "=== Launching ${run} WITHOUT tools ==="
@@ -54,7 +61,7 @@ for run in "${RUNS[@]}"; do
         --model_path "$model_path" \
         --eval_dataset "$EVAL_DATASET" \
         --output_dir "$OUTPUT_DIR" \
-        --output_name "${run}_no_tools" \
+        --output_name "${run}_v2_no_tools" \
         --no_tools &
 done
 

@@ -1,19 +1,17 @@
-"""RLOO training loop with failure-mode-aware tool integration.
+"""RLOO training loop with Tool-Star hierarchical reward + optional DPO self-critic.
 
 Subclasses ``RLOOTrainer`` to:
 
-1) Execute any ``<use_tool>...</use_tool>`` calls in each sampled response
-   and splice the real outputs in as ``<tool_result>...</tool_result>``.
-2) Score rollouts with ``compute_score_with_tools`` so the policy gets a
-   shaping signal for invoking the *right* tools.
-3) Push every failed rollout into a persistent ``FailureDatabase`` and
-   periodically ask a DSPy analyzer to refresh the set of active tools.
-4) Build a ``tool_result_mask`` so the deterministic tool-output tokens
+1) Execute any ``<use_tool>...</use_tool>`` calls via multi-turn sampling.
+2) Score rollouts with ``compute_hierarchical_reward`` (Tool-Star eq. 3).
+3) Build a ``tool_result_mask`` so deterministic tool-output tokens
    are excluded from the policy-gradient / entropy / KL terms.
+4) Optionally run a DPO self-critic phase every k steps (Tool-Star Algorithm 1).
 
 Designed to run on Modal exactly like the baseline RLOO trainer:
 
     modal run modal_train.py tir_rloo -- --num_training_steps 250
+    modal run modal_train.py tir_rloo -- --num_training_steps 250 --self_critic
 """
 
 from __future__ import annotations
@@ -35,154 +33,95 @@ if PROJECT_ROOT not in sys.path:
 warnings.filterwarnings("ignore")
 
 from rloo_trainer.rloo import RLOOTrainer
-from tir_extension.data.failure_database import FailureDatabase, DEFAULT_DB_PATH
 from tir_extension.tools.tool_pool import (
-    TOOL_REGISTRY,
     execute_tool_calls,
     find_tool_result_spans,
     relevant_tool_names,
 )
-from tir_extension.training.dynamic_tool_selector import DynamicToolSelector
-from tir_extension.training.failure_aware_reward import (
-    aggregate_tool_metrics,
-    compute_score_with_tools,
+from tir_extension.training.hierarchical_reward import (
+    compute_hierarchical_reward,
+    aggregate_hierarchical_metrics,
 )
 from tir_extension.training.tir_sampling_worker import TIRSamplingWorker
 from tir_extension.tools.system_prompt import build_tool_system_prompt
 
 
 def _inject_tool_system_prompt(prompt: str, tool_system_prompt: str) -> str:
-    """Replace the default system message in a chat-templated prompt with I^T.
-
-    The dataset prompts have ``<|im_start|>system\\nYou are a helpful assistant.<|im_end|>``
-    baked in. We replace that with our tool-integrated instruction so the model
-    knows what tools are available during RLOO rollouts.
-    """
+    """Replace the default system message in a chat-templated prompt with I^T."""
     old_system = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
     new_system = f"<|im_start|>system\n{tool_system_prompt}<|im_end|>"
     if old_system in prompt:
         return prompt.replace(old_system, new_system, 1)
-    # If the prompt doesn't have the expected system tag, prepend it.
     return new_system + "\n" + prompt
 
 
 class TIRRLOOTrainer(RLOOTrainer):
-    """RLOO trainer with failure-aware tool integration."""
+    """RLOO trainer with hierarchical reward + optional DPO self-critic."""
 
     def __init__(
         self,
-        # TIR-specific.
-        reanalyze_every_n_steps: int = 3,
-        tool_reward: float = 0.1,
-        tool_penalty: float = 0.1,
-        min_failures_before_analysis: int = 50,
-        failure_db_path: str | None = DEFAULT_DB_PATH,
-        max_failures_per_db: int = 5000,
-        analyzer_sample_size: int = 20,
-        dspy_model: str | None = None,
-        dspy_max_tokens: int | None = None,
+        # Tool config
         initial_active_tools: str | None = None,
-        max_tool_call_truncation: int = 16,
-        save_failure_db_every_n_steps: int = 5,
-        multi_turn_tools: bool = True,
         max_tool_turns: int = 5,
-        # Everything else is forwarded straight to RLOOTrainer.
+        multi_tool_bonus: float = 0.1,
+        min_tools_for_bonus: int = 2,
+        # Self-critic config (Tool-Star Algorithm 1)
+        self_critic: bool = False,
+        self_critic_every_k: int = 5,
+        self_critic_n_samples: int = 8,
+        self_critic_beta: float = 0.1,
+        self_critic_threshold: float = 1.0,
+        # Everything else forwarded to RLOOTrainer.
         **rloo_kwargs,
     ):
         super().__init__(**rloo_kwargs)
 
-        self.reanalyze_every_n_steps = reanalyze_every_n_steps
-        self.tool_reward = tool_reward
-        self.tool_penalty = tool_penalty
-        self.min_failures_before_analysis = min_failures_before_analysis
-        self.failure_db_path = failure_db_path
-        self.analyzer_sample_size = analyzer_sample_size
-        self.dspy_model = dspy_model
-        self.dspy_max_tokens = dspy_max_tokens
-        self.max_tool_call_truncation = max_tool_call_truncation
-        self.save_failure_db_every_n_steps = save_failure_db_every_n_steps
-        self.multi_turn_tools = multi_turn_tools
         self.max_tool_turns = max_tool_turns
-        self._tool_system_prompt: str | None = None  # built after active tools are set
+        self.multi_tool_bonus = multi_tool_bonus
+        self.min_tools_for_bonus = min_tools_for_bonus
+        self.self_critic = self_critic
+        self.self_critic_every_k = self_critic_every_k
+        self.self_critic_n_samples = self_critic_n_samples
+        self.self_critic_beta = self_critic_beta
+        self.self_critic_threshold = self_critic_threshold
 
-        # Bounded persistent log of failed rollouts (seeded if a baseline run
-        # already wrote one to the same path).
-        self.failure_db = FailureDatabase(
-            path=self.failure_db_path,
-            max_records=max_failures_per_db,
-        )
-
-        initial_tools: set[str] | None
+        # Parse active tools
         if initial_active_tools:
-            initial_tools = {
+            self.active_tools: set[str] = {
                 name.strip()
                 for name in initial_active_tools.split(",")
                 if name.strip()
             }
-            unknown = initial_tools - set(TOOL_REGISTRY)
-            if unknown:
-                raise ValueError(f"Unknown initial_active_tools: {sorted(unknown)}")
         else:
-            # Start with every relevant tool active. DSPy will reduce/expand
-            # this on the first reanalysis once enough failures accumulate.
-            initial_tools = relevant_tool_names()
+            self.active_tools = relevant_tool_names()
 
-        self.tool_selector = DynamicToolSelector(
-            initial_tools=initial_tools,
-            candidate_tools=set(TOOL_REGISTRY),
-        )
-
-        # Build the tool-integrated system prompt (I^T) for RLOO rollouts.
+        # Build tool-integrated instruction (I^T)
         self._tool_system_prompt = build_tool_system_prompt(
-            active_tools=self.tool_selector.active_tools
+            active_tools=self.active_tools
         )
         print(f"[TIR] Tool system prompt (I^T):\n{self._tool_system_prompt}\n")
+        print(f"[TIR] Active tools: {sorted(self.active_tools)}")
+        print(f"[TIR] Self-critic: {self.self_critic}")
+        if self.self_critic:
+            print(f"[TIR] Self-critic every {self.self_critic_every_k} steps, "
+                  f"n_samples={self.self_critic_n_samples}, beta={self.self_critic_beta}")
 
-        # Build the analyzer lazily so that runs without DSPy installed can
-        # still construct the trainer (they will fail only when reanalyse is
-        # actually invoked, which is gated on having enough failures anyway).
-        self._analyzer = None
-
-        # Mirror these on wandb config so they appear alongside the existing
-        # RLOOTrainer hyperparameters.
-        self.wandb.config.update(
-            {
-                "tir_reanalyze_every_n_steps": reanalyze_every_n_steps,
-                "tir_tool_reward": tool_reward,
-                "tir_tool_penalty": tool_penalty,
-                "tir_min_failures_before_analysis": min_failures_before_analysis,
-                "tir_failure_db_path": failure_db_path,
-                "tir_initial_active_tools": sorted(self.tool_selector.active_tools),
-                "tir_candidate_tools": sorted(self.tool_selector.candidate_tools),
-            }
-        )
+        self.wandb.config.update({
+            "tir_active_tools": sorted(self.active_tools),
+            "tir_multi_tool_bonus": multi_tool_bonus,
+            "tir_min_tools_for_bonus": min_tools_for_bonus,
+            "tir_self_critic": self_critic,
+            "tir_self_critic_every_k": self_critic_every_k,
+            "tir_self_critic_n_samples": self_critic_n_samples,
+            "tir_self_critic_beta": self_critic_beta,
+        })
 
     # ------------------------------------------------------------------
-    # Analyzer lazy-init.
-    # ------------------------------------------------------------------
-
-    def _get_analyzer(self):
-        if self._analyzer is None:
-            from tir_extension.tools.dspy_failure_analyzer import (
-                FailureAnalyzerModule,
-            )
-
-            self._analyzer = FailureAnalyzerModule(
-                model=self.dspy_model,
-                max_tokens=self.dspy_max_tokens,
-            )
-        return self._analyzer
-
-    # ------------------------------------------------------------------
-    # Multi-turn sampling worker override.
+    # Multi-turn sampling worker
     # ------------------------------------------------------------------
 
     def _create_sampling_worker(self, model_path):
         """Create a TIR sampling worker with multi-turn tool execution."""
-        if not self.multi_turn_tools:
-            # Fall back to baseline single-pass sampling
-            return super()._create_sampling_worker(model_path)
-
         if self.update_worker is not None:
             ray.kill(self.update_worker)
             self.update_worker = None
@@ -201,31 +140,19 @@ class TIRRLOOTrainer(RLOOTrainer):
             max_tokens=self.max_tokens,
             group_size=self.group_size,
             max_tool_turns=self.max_tool_turns,
-            active_tools=set(self.tool_selector.active_tools),
+            active_tools=set(self.active_tools),
         )
         ray.get(self.sampling_worker.load_checkpoint.remote())
         return self.sampling_worker
 
     # ------------------------------------------------------------------
-    # Tokenization with tool-result mask.
+    # Tokenization with tool-result mask
     # ------------------------------------------------------------------
 
     def tokenize_batch_tir(
         self, batch: dict, group_size_override: int | None = None
     ) -> dict[str, np.ndarray]:
-        """Same flattening as ``tokenize_batch`` plus a tool-result token mask.
-
-        Args:
-            batch: dict with prompt/response/rewards/sample_log_probs lists.
-            group_size_override: number of responses per prompt when different
-                from ``self.group_size`` (e.g. during the self-critic phase).
-
-        Returns the standard tokenized fields and an additional
-        ``tool_result_mask`` array shaped ``[batch*group, seq_len]`` with 1
-        on tokens whose character range falls inside a
-        ``<tool_result>...</tool_result>`` span (always within the response
-        portion).
-        """
+        """Tokenize with tool-result mask."""
         n = group_size_override if group_size_override is not None else self.group_size
 
         all_prompts = batch["prompt"]
@@ -239,7 +166,6 @@ class TIRRLOOTrainer(RLOOTrainer):
         sample_lp_flat = [item for sublist in all_sample_log_probs for item in sublist]
         assert len(prompts_repeated) == len(responses_flat) == len(rewards_flat)
 
-        # Prompts: identical handling to the parent class.
         self.tokenizer.padding_side = "left"
         tokenized_prompts = self.tokenizer(
             prompts_repeated,
@@ -250,8 +176,6 @@ class TIRRLOOTrainer(RLOOTrainer):
             return_tensors="np",
         )
 
-        # Responses: also request offset_mapping so we can build the
-        # tool-result mask without retokenising each span.
         self.tokenizer.padding_side = "right"
         tokenized_responses = self.tokenizer(
             responses_flat,
@@ -283,7 +207,6 @@ class TIRRLOOTrainer(RLOOTrainer):
                         response_tool_mask[i, tok_idx] = 1
                         break
 
-        # Concatenate prompt + response halves to match the parent layout.
         input_ids = np.concatenate([prompt_input_ids, response_input_ids], axis=1)
         attention_mask = np.concatenate(
             [prompt_attention_mask, response_attention_mask], axis=1
@@ -305,8 +228,195 @@ class TIRRLOOTrainer(RLOOTrainer):
             "sample_log_probs": np.array(sample_lp_flat, dtype=np.float32),
         }
 
+    def _tokenize_single_sequences(
+        self, prompts: list[str], responses: list[str]
+    ) -> dict[str, np.ndarray]:
+        """Tokenize prompt+response pairs (for DPO self-critic)."""
+        self.tokenizer.padding_side = "left"
+        tok_p = self.tokenizer(
+            prompts, add_special_tokens=False, padding=True,
+            truncation=True, max_length=self.max_prompt_length, return_tensors="np",
+        )
+        self.tokenizer.padding_side = "right"
+        tok_r = self.tokenizer(
+            responses, add_special_tokens=False, padding=True,
+            truncation=True, max_length=self.max_response_length,
+            return_tensors="np", return_offsets_mapping=True,
+        )
+
+        r_ids = tok_r["input_ids"]
+        offsets = tok_r["offset_mapping"]
+        r_tool_mask = np.zeros_like(r_ids, dtype=np.int64)
+        for i, resp in enumerate(responses):
+            spans = find_tool_result_spans(resp)
+            if not spans:
+                continue
+            for tok_idx in range(r_ids.shape[1]):
+                s, e = int(offsets[i, tok_idx, 0]), int(offsets[i, tok_idx, 1])
+                if s == e:
+                    continue
+                for ss, se in spans:
+                    if s < se and e > ss:
+                        r_tool_mask[i, tok_idx] = 1
+                        break
+
+        input_ids = np.concatenate([tok_p["input_ids"], r_ids], axis=1)
+        attention_mask = np.concatenate(
+            [tok_p["attention_mask"], tok_r["attention_mask"]], axis=1
+        )
+        is_response = np.concatenate(
+            [np.zeros_like(tok_p["input_ids"]), np.ones_like(r_ids)], axis=1
+        )
+        tool_mask = np.concatenate(
+            [np.zeros_like(tok_p["input_ids"]), r_tool_mask], axis=1
+        )
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "is_response_token": is_response,
+            "tool_result_mask": tool_mask,
+        }
+
     # ------------------------------------------------------------------
-    # Main loop.
+    # DPO Self-Critic (Tool-Star Algorithm 1)
+    # ------------------------------------------------------------------
+
+    def _run_self_critic(
+        self,
+        model_path: str,
+        prompts_with_gt: list[tuple[str, dict]],
+        global_step: int,
+    ) -> dict | None:
+        """Self-sample, form preference pairs, run DPO update.
+
+        For each prompt:
+        1. Sample n responses with the current policy
+        2. Score with hierarchical reward
+        3. Responses with reward >= threshold are "chosen", < threshold are "rejected"
+        4. Form all (chosen, rejected) pairs and run DPO update
+        """
+        n = self.self_critic_n_samples
+
+        # Use a subset of prompts to keep compute reasonable
+        prompts = [p for p, _ in prompts_with_gt]
+        ground_truths = [gt for _, gt in prompts_with_gt]
+
+        # Inject I^T
+        prompts_it = [
+            _inject_tool_system_prompt(p, self._tool_system_prompt) for p in prompts
+        ]
+
+        print(f"[TIR] Self-critic: sampling {n} responses for {len(prompts)} prompts",
+              flush=True)
+
+        # Sample from current policy
+        self._create_sampling_worker(model_path)
+        all_responses, all_logprobs = ray.get(
+            self.sampling_worker.generate.remote(prompts_it, n=n)
+        )
+
+        # Score with hierarchical reward
+        chosen_prompts, chosen_responses = [], []
+        rejected_prompts, rejected_responses = [], []
+
+        for prompt, responses, gt in zip(prompts_it, all_responses, ground_truths):
+            pos, neg = [], []
+            for resp in responses:
+                reward, _ = compute_hierarchical_reward(
+                    resp, gt,
+                    active_tools=self.active_tools,
+                    multi_tool_bonus=self.multi_tool_bonus,
+                    min_tools_for_bonus=self.min_tools_for_bonus,
+                )
+                if reward >= self.self_critic_threshold:
+                    pos.append(resp)
+                else:
+                    neg.append(resp)
+
+            # Form pairs: each positive paired with each negative
+            for p_resp in pos:
+                for n_resp in neg:
+                    chosen_prompts.append(prompt)
+                    chosen_responses.append(p_resp)
+                    rejected_prompts.append(prompt)
+                    rejected_responses.append(n_resp)
+
+        n_pairs = len(chosen_prompts)
+        if n_pairs == 0:
+            print("[TIR] Self-critic: no preference pairs formed (all same label)",
+                  flush=True)
+            return None
+
+        # Cap pairs to avoid OOM — randomly subsample if too many
+        max_pairs = 32
+        if n_pairs > max_pairs:
+            import random as rng
+            indices = rng.sample(range(n_pairs), max_pairs)
+            chosen_prompts = [chosen_prompts[i] for i in indices]
+            chosen_responses = [chosen_responses[i] for i in indices]
+            rejected_prompts = [rejected_prompts[i] for i in indices]
+            rejected_responses = [rejected_responses[i] for i in indices]
+            n_pairs = max_pairs
+
+        print(f"[TIR] Self-critic: formed {n_pairs} preference pairs", flush=True)
+
+        # Tokenize chosen and rejected
+        chosen_tok = self._tokenize_single_sequences(chosen_prompts, chosen_responses)
+        rejected_tok = self._tokenize_single_sequences(rejected_prompts, rejected_responses)
+
+        # Need the update worker loaded with current model
+        # The sampling worker must be killed first (single GPU)
+        optimizer_path = os.path.join(
+            self.save_dir, self.wandb_project, self.wandb_name,
+            "latest_checkpoint", "optimizer.pt"
+        )
+        scheduler_path = os.path.join(
+            self.save_dir, self.wandb_project, self.wandb_name,
+            "latest_checkpoint", "scheduler.pt"
+        )
+        if not os.path.exists(optimizer_path):
+            optimizer_path = None
+            scheduler_path = None
+
+        self._create_update_worker(model_path, optimizer_path, scheduler_path)
+
+        dpo_metrics = ray.get(
+            self.update_worker.dpo_update.remote(
+                chosen_input_ids=chosen_tok["input_ids"],
+                chosen_attention_mask=chosen_tok["attention_mask"],
+                chosen_is_response_token=chosen_tok["is_response_token"],
+                rejected_input_ids=rejected_tok["input_ids"],
+                rejected_attention_mask=rejected_tok["attention_mask"],
+                rejected_is_response_token=rejected_tok["is_response_token"],
+                chosen_tool_result_mask=chosen_tok["tool_result_mask"],
+                rejected_tool_result_mask=rejected_tok["tool_result_mask"],
+                beta=self.self_critic_beta,
+            )
+        )
+
+        # Save checkpoint after DPO update
+        save_dir = os.path.join(
+            self.save_dir, self.wandb_project, self.wandb_name, "latest_checkpoint"
+        )
+        os.makedirs(save_dir, exist_ok=True)
+        save_model_path = os.path.join(save_dir, "model")
+        save_optimizer_path = os.path.join(save_dir, "optimizer.pt")
+        save_scheduler_path = os.path.join(save_dir, "scheduler.pt")
+        ray.get(
+            self.update_worker.update_checkpoint_paths.remote(
+                model_path=save_model_path,
+                optimizer_path=save_optimizer_path,
+                scheduler_path=save_scheduler_path,
+                load_checkpoint=False,
+            )
+        )
+        ray.get(self.update_worker.save_checkpoint.remote())
+
+        print(f"[TIR] Self-critic DPO metrics: {dpo_metrics}", flush=True)
+        return dpo_metrics
+
+    # ------------------------------------------------------------------
+    # Main loop
     # ------------------------------------------------------------------
 
     def train(self):  # type: ignore[override]
@@ -315,6 +425,9 @@ class TIRRLOOTrainer(RLOOTrainer):
 
         last_checkpoint_dir = None
         global_step = 0
+        # Collect prompts+gt for self-critic sampling
+        self_critic_buffer: list[tuple[str, dict]] = []
+
         for epoch in range(self.num_epochs):
             if global_step > 0 and global_step == self.num_training_steps:
                 break
@@ -338,53 +451,31 @@ class TIRRLOOTrainer(RLOOTrainer):
                 all_ground_truth = batch["ground_truth"]
                 assert (
                     len(all_prompts_raw) == len(all_ground_truth) == self.batch_size
-                ), (
-                    f"len(all_prompts) = {len(all_prompts_raw)}, "
-                    f"len(all_ground_truth) = {len(all_ground_truth)}, "
-                    f"self.batch_size = {self.batch_size}"
                 )
-                # Inject tool-integrated instruction (I^T) into prompts.
+
+                # Inject I^T
                 all_prompts = [
                     _inject_tool_system_prompt(p, self._tool_system_prompt)
                     for p in all_prompts_raw
                 ]
-                all_raw_responses, all_sample_log_probs = ray.get(
+                all_responses, all_sample_log_probs = ray.get(
                     self.sampling_worker.generate.remote(all_prompts)
                 )
 
-                # ----- 2) Tool execution -----
-                active_tools = set(self.tool_selector.active_tools)
-                if self.multi_turn_tools:
-                    # Tools already executed during multi-turn sampling
-                    all_responses = all_raw_responses
-                else:
-                    # Post-hoc tool execution (single-pass fallback)
-                    all_responses: list[list[str]] = []
-                    for raw_group in all_raw_responses:
-                        materialised = [
-                            execute_tool_calls(
-                                response,
-                                active_tools=active_tools,
-                                max_calls=self.max_tool_call_truncation,
-                            )
-                            for response in raw_group
-                        ]
-                        all_responses.append(materialised)
-
-                # ----- 3) Tool-aware rewards -----
+                # ----- 2) Hierarchical rewards (Tool-Star eq. 3) -----
                 all_rewards: list[list[float]] = []
                 all_meta: list[dict] = []
                 for resp_group, gt in zip(all_responses, all_ground_truth):
                     group_rewards = []
                     for resp in resp_group:
-                        score, meta = compute_score_with_tools(
+                        reward, meta = compute_hierarchical_reward(
                             response=resp,
                             ground_truth=gt,
-                            active_tools=active_tools,
-                            tool_reward=self.tool_reward,
-                            tool_penalty=self.tool_penalty,
+                            active_tools=self.active_tools,
+                            multi_tool_bonus=self.multi_tool_bonus,
+                            min_tools_for_bonus=self.min_tools_for_bonus,
                         )
-                        group_rewards.append(score)
+                        group_rewards.append(reward)
                         all_meta.append(meta)
                     all_rewards.append(group_rewards)
 
@@ -394,29 +485,23 @@ class TIRRLOOTrainer(RLOOTrainer):
                 )
                 print(
                     f"[TIR] step={global_step} reward_mean={reward_mean:.3f} "
-                    f"base_score_mean={base_score_mean:.3f} "
-                    f"active_tools={sorted(active_tools)}",
+                    f"base_score_mean={base_score_mean:.3f}",
                     flush=True,
                 )
-
-                # ----- 4) Failure DB -----
-                for prompt, resp_group, gt, group_rewards in zip(
-                    all_prompts, all_responses, all_ground_truth, all_rewards
-                ):
-                    for resp, score in zip(resp_group, group_rewards):
-                        self.failure_db.add(
-                            prompt=prompt,
-                            response=resp,
-                            ground_truth=gt,
-                            score=score,
-                            step=global_step,
-                        )
 
                 generation_table = self._build_generation_table(
                     all_prompts, all_responses, all_rewards
                 )
 
-                # ----- 5) Tokenize -----
+                # Buffer prompts for self-critic
+                if self.self_critic:
+                    for p, gt in zip(all_prompts_raw, all_ground_truth):
+                        self_critic_buffer.append((p, gt))
+                    # Keep buffer bounded
+                    if len(self_critic_buffer) > self.batch_size * 10:
+                        self_critic_buffer = self_critic_buffer[-self.batch_size * 5:]
+
+                # ----- 3) Tokenize -----
                 tokenized = self.tokenize_batch_tir(
                     {
                         "prompt": all_prompts,
@@ -426,7 +511,7 @@ class TIRRLOOTrainer(RLOOTrainer):
                     }
                 )
 
-                # ----- 6) Update -----
+                # ----- 4) RLOO Update -----
                 optimizer_path = (
                     None
                     if last_checkpoint_dir is None
@@ -450,19 +535,15 @@ class TIRRLOOTrainer(RLOOTrainer):
                     )
                 )
 
-                # ----- 7) Checkpoint -----
+                # ----- 5) Checkpoint -----
                 if self.save_every_n_steps > 0 and global_step % self.save_every_n_steps == 0:
                     save_dir = os.path.join(
-                        self.save_dir,
-                        self.wandb_project,
-                        self.wandb_name,
+                        self.save_dir, self.wandb_project, self.wandb_name,
                         f"epoch_{epoch}_step_{global_step}",
                     )
                 else:
                     save_dir = os.path.join(
-                        self.save_dir,
-                        self.wandb_project,
-                        self.wandb_name,
+                        self.save_dir, self.wandb_project, self.wandb_name,
                         "latest_checkpoint",
                     )
                 if os.path.exists(save_dir):
@@ -483,77 +564,46 @@ class TIRRLOOTrainer(RLOOTrainer):
                 ray.get(self.update_worker.save_checkpoint.remote())
                 last_checkpoint_dir = save_dir
 
-                # ----- 8) Periodic DSPy re-analysis -----
-                reanalysis_payload = None
-                if DynamicToolSelector.should_reanalyze(
-                    global_step + 1, self.reanalyze_every_n_steps
-                ):
-                    try:
-                        analyzer = self._get_analyzer()
-                        reanalysis_payload = self.tool_selector.reanalyze(
-                            failure_db=self.failure_db,
-                            analyzer=analyzer,
-                            step=global_step,
-                            n_samples=self.analyzer_sample_size,
-                            min_failures=self.min_failures_before_analysis,
-                        )
-                        print(
-                            f"[TIR] DSPy reanalysis: {reanalysis_payload}",
-                            flush=True,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[TIR] reanalysis failed: {exc}", flush=True)
-
-                # ----- 9) Periodic failure-DB persistence -----
+                # ----- 6) Self-Critic DPO (Tool-Star Algorithm 1) -----
+                dpo_metrics = None
                 if (
-                    self.failure_db_path
-                    and self.save_failure_db_every_n_steps > 0
-                    and (global_step + 1) % self.save_failure_db_every_n_steps == 0
+                    self.self_critic
+                    and (global_step + 1) % self.self_critic_every_k == 0
+                    and len(self_critic_buffer) >= self.batch_size
                 ):
-                    try:
-                        self.failure_db.save(self.failure_db_path)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[TIR] failed to save failure DB: {exc}", flush=True)
+                    # Sample a batch of prompts from buffer
+                    import random as rng
+                    sc_prompts = rng.sample(
+                        self_critic_buffer,
+                        min(self.batch_size, len(self_critic_buffer)),
+                    )
+                    sc_model_path = os.path.join(last_checkpoint_dir, "model")
+                    dpo_metrics = self._run_self_critic(
+                        sc_model_path, sc_prompts, global_step
+                    )
 
-                # ----- 10) Logging -----
-                tool_metrics = aggregate_tool_metrics(all_meta)
-                failure_counts = self.failure_db.failure_type_counts()
+                # ----- 7) Logging -----
+                hier_metrics = aggregate_hierarchical_metrics(all_meta)
                 log_dict = {
                     "train/epoch": epoch,
                     "train/train_iter": train_iter,
                     "train/global_step": global_step,
                     "sampling/reward_mean": reward_mean,
                     "sampling/base_score_mean": base_score_mean,
-                    "tir/failure_db_size": len(self.failure_db),
-                    "tir/n_active_tools": len(self.tool_selector.active_tools),
-                    "tir/active_tools": ",".join(
-                        sorted(self.tool_selector.active_tools)
-                    ),
                     **{f"train/{k}": v for k, v in all_metrics.items()},
-                    **tool_metrics,
-                    **{
-                        f"tir/failure_type_{name}": count
-                        for name, count in failure_counts.items()
-                    },
+                    **hier_metrics,
                 }
-                if reanalysis_payload is not None:
-                    log_dict["tir/reanalysis_step"] = reanalysis_payload.get(
-                        "step", global_step
-                    )
+                if dpo_metrics is not None:
+                    log_dict.update({
+                        f"self_critic/{k}": v for k, v in dpo_metrics.items()
+                    })
                 if generation_table is not None:
                     log_dict["samples/generations"] = generation_table
 
                 self.wandb.log(log_dict, step=global_step)
-
                 global_step += 1
 
-        # Persist final failure DB and tear down Ray actors.
-        if self.failure_db_path:
-            try:
-                self.failure_db.save(self.failure_db_path)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[TIR] failed to save failure DB at exit: {exc}", flush=True)
-
+        # Tear down
         if self.sampling_worker is not None:
             ray.kill(self.sampling_worker)
             self.sampling_worker = None
@@ -565,12 +615,13 @@ class TIRRLOOTrainer(RLOOTrainer):
 
 
 # ---------------------------------------------------------------------------
-# CLI mirroring rloo.py + the TIR-specific flags.
+# CLI
 # ---------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    # Base RLOO args
     parser.add_argument("--model_name", type=str,
                         default="asingh15/qwen-sft-countdown-defaultproj")
     parser.add_argument("--ref_model_name", type=str, default=None)
@@ -607,25 +658,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_dir", type=str,
                         default="/vol/checkpoints/tir_rloo_checkpoints")
 
-    # TIR-specific.
-    parser.add_argument("--reanalyze_every_n_steps", type=int, default=3)
-    parser.add_argument("--tool_reward", type=float, default=0.1)
-    parser.add_argument("--tool_penalty", type=float, default=0.1)
-    parser.add_argument("--min_failures_before_analysis", type=int, default=50)
-    parser.add_argument("--failure_db_path", type=str, default=DEFAULT_DB_PATH)
-    parser.add_argument("--max_failures_per_db", type=int, default=5000)
-    parser.add_argument("--analyzer_sample_size", type=int, default=20)
-    parser.add_argument("--dspy_model", type=str, default=None)
-    parser.add_argument("--dspy_max_tokens", type=int, default=None)
+    # TIR-specific
     parser.add_argument("--initial_active_tools", type=str, default=None,
-                        help="Comma-separated subset of tool names. Defaults to all relevant.")
-    parser.add_argument("--max_tool_call_truncation", type=int, default=16)
-    parser.add_argument("--save_failure_db_every_n_steps", type=int, default=5)
-    parser.add_argument("--multi_turn_tools", action="store_true", default=True,
-                        help="Use multi-turn tool execution during sampling (default).")
-    parser.add_argument("--no_multi_turn_tools", action="store_true",
-                        help="Disable multi-turn; use post-hoc tool execution.")
+                        help="Comma-separated tool names. Defaults to all relevant.")
     parser.add_argument("--max_tool_turns", type=int, default=5)
+    parser.add_argument("--multi_tool_bonus", type=float, default=0.1)
+    parser.add_argument("--min_tools_for_bonus", type=int, default=2)
+
+    # Self-critic (Tool-Star Algorithm 1)
+    parser.add_argument("--self_critic", action="store_true",
+                        help="Enable DPO self-critic phase (Tool-Star Algorithm 1).")
+    parser.add_argument("--self_critic_every_k", type=int, default=5,
+                        help="Run self-critic every k RLOO steps.")
+    parser.add_argument("--self_critic_n_samples", type=int, default=8,
+                        help="Number of responses to sample per prompt for self-critic.")
+    parser.add_argument("--self_critic_beta", type=float, default=0.1,
+                        help="DPO temperature parameter for self-critic.")
+    parser.add_argument("--self_critic_threshold", type=float, default=1.0,
+                        help="Reward threshold for positive/negative labeling.")
     return parser
 
 
@@ -641,22 +691,16 @@ def main():
     else:
         enable_chunked_prefill = True
 
-    # Split args into base-RLOO kwargs and TIR-specific kwargs.
     tir_kwargs = {
-        "reanalyze_every_n_steps": args.reanalyze_every_n_steps,
-        "tool_reward": args.tool_reward,
-        "tool_penalty": args.tool_penalty,
-        "min_failures_before_analysis": args.min_failures_before_analysis,
-        "failure_db_path": args.failure_db_path,
-        "max_failures_per_db": args.max_failures_per_db,
-        "analyzer_sample_size": args.analyzer_sample_size,
-        "dspy_model": args.dspy_model,
-        "dspy_max_tokens": args.dspy_max_tokens,
         "initial_active_tools": args.initial_active_tools,
-        "max_tool_call_truncation": args.max_tool_call_truncation,
-        "save_failure_db_every_n_steps": args.save_failure_db_every_n_steps,
-        "multi_turn_tools": not args.no_multi_turn_tools,
         "max_tool_turns": args.max_tool_turns,
+        "multi_tool_bonus": args.multi_tool_bonus,
+        "min_tools_for_bonus": args.min_tools_for_bonus,
+        "self_critic": args.self_critic,
+        "self_critic_every_k": args.self_critic_every_k,
+        "self_critic_n_samples": args.self_critic_n_samples,
+        "self_critic_beta": args.self_critic_beta,
+        "self_critic_threshold": args.self_critic_threshold,
     }
     rloo_kwargs = dict(
         model_name=args.model_name,

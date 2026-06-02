@@ -147,12 +147,14 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0% (`eval_results/sf
 ### Run 8: TIR SFT v2 — 3-tool, from vanilla SFT checkpoint
 - **Date**: 2026-06-01
 - **Base model**: `asingh15/qwen-sft-countdown-defaultproj`
-- **Dataset**: `tir_trajectories_2000.json` (1707 trajectories, 3 tools)
+- **Dataset**: `tir_trajectories_2000.json` (1698 trajectories after cleaning 9 malformed, 3 tools)
 - **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048, warmup_ratio=0.05
 - **I^T**: 3-tool system prompt (calculator, number_tracker, running_total)
 - **W&B**: `tir_sft_project_v2` / `3tool_from_sft`
 - **HF repo**: `sbfisher/tir-sft-3tool_from_sft`
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: pass@1=58.0%, pass@4=71.3%, pass@8=75.0%, pass@16=78.0%
+- **Eval results (no tools)**: pass@1=50.6%, pass@4=69.1%, pass@8=76.0%, pass@16=82.0%
 
 ### Run 9: TIR SFT v2 — 3-tool, from base Qwen (cold start)
 - **Date**: 2026-06-01
@@ -162,7 +164,9 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0% (`eval_results/sf
 - **I^T**: 3-tool system prompt
 - **W&B**: `tir_sft_project_v2` / `3tool_from_base`
 - **HF repo**: `sbfisher/tir-sft-3tool_from_base`
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: pass@1=53.6%, pass@4=67.7%, pass@8=72.9%, pass@16=78.0%
+- **Eval results (no tools)**: pass@1=15.1%, pass@4=41.0%, pass@8=54.5%, pass@16=62.0%
 
 ### Run 10: TIR SFT v2 — calculator-only, from vanilla SFT checkpoint
 - **Date**: 2026-06-01
@@ -172,7 +176,9 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0% (`eval_results/sf
 - **I^T**: calculator-only system prompt (`--active_tools calculator`)
 - **W&B**: `tir_sft_project_v2` / `calc_only_from_sft`
 - **HF repo**: `sbfisher/tir-sft-calc_only_from_sft`
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: pass@1=57.0%, pass@4=69.9%, pass@8=74.3%, pass@16=78.0%
+- **Eval results (no tools)**: pass@1=46.4%, pass@4=66.3%, pass@8=71.1%, pass@16=74.0%
 
 ### Run 11: TIR SFT v2 — calculator-only, from base Qwen (cold start)
 - **Date**: 2026-06-01
@@ -182,7 +188,68 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0% (`eval_results/sf
 - **I^T**: calculator-only system prompt (`--active_tools calculator`)
 - **W&B**: `tir_sft_project_v2` / `calc_only_from_base`
 - **HF repo**: `sbfisher/tir-sft-calc_only_from_base`
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: pass@1=47.9%, pass@4=65.0%, pass@8=68.8%, pass@16=72.0%
+- **Eval results (no tools)**: pass@1=15.0%, pass@4=39.8%, pass@8=52.9%, pass@16=62.0%
+
+### TIR SFT v2 Eval Summary (Runs 8-11)
+
+Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0%
+
+| Run | Base Model | Tools | pass@1 | pass@4 | pass@8 | pass@16 |
+|-----|-----------|-------|--------|--------|--------|---------|
+| 3tool_from_sft v2 | Vanilla SFT | Yes | **58.0%** | **71.3%** | 75.0% | 78.0% |
+| calc_only_from_sft v2 | Vanilla SFT | Yes | 57.0% | 69.9% | 74.3% | 78.0% |
+| 3tool_from_base v2 | Base Qwen | Yes | 53.6% | 67.7% | 72.9% | 78.0% |
+| 3tool_from_sft v2 | Vanilla SFT | No | 50.6% | 69.1% | 76.0% | **82.0%** |
+| calc_only_from_base v2 | Base Qwen | Yes | 47.9% | 65.0% | 68.8% | 72.0% |
+| calc_only_from_sft v2 | Vanilla SFT | No | 46.4% | 66.3% | 71.1% | 74.0% |
+| 3tool_from_base v2 | Base Qwen | No | 15.1% | 41.0% | 54.5% | 62.0% |
+| calc_only_from_base v2 | Base Qwen | No | 15.0% | 39.8% | 52.9% | 62.0% |
+
+**v2 vs v1 comparison (best with-tools pass@1):**
+- v2 3tool_from_sft: 58.0% vs v1: 56.5% (+1.5pp)
+- v2 calc_only_from_sft: 57.0% vs v1: 57.8% (-0.8pp)
+- v2 3tool_from_base: 53.6% vs v1: 50.0% (+3.6pp)
+- v2 calc_only_from_base: 47.9% vs v1: 51.5% (-3.6pp)
+
+**Key takeaways (v2):**
+1. **3tool_from_sft is now the best model** (58.0% pass@1 with tools) — I^T helps the 3-tool model leverage all tools more effectively.
+2. **I^T dramatically hurts cold-start models without tools** — base Qwen models drop to ~15% pass@1 without tools (vs 38-42% in v1). The model becomes tool-dependent when trained with I^T from scratch.
+3. **Warm-start models retain no-tools ability** — 3tool_from_sft actually *improves* without tools (50.6% vs 41.8% in v1), suggesting I^T teaches better structured reasoning even without tool execution.
+4. **3tool_from_sft v2 has highest pass@16 without tools** (82.0%) — best ceiling of any model.
+5. **Best RLOO candidate: `sbfisher/tir-sft-3tool_from_sft`** — highest pass@1 with tools, strong no-tools fallback, highest ceiling.
+
+---
+
+## Runs 12-13: TIR RLOO — Hierarchical Reward +/- DPO Self-Critic
+
+**Motivation:** After TIR SFT, apply RLOO with the Tool-Star hierarchical reward (eq. 3) and optionally the DPO self-critic (Algorithm 1). Two runs in parallel:
+- **Phase 1**: Vanilla RLOO + hierarchical reward (no self-critic) — clean ablation
+- **Phase 2**: RLOO + hierarchical reward + DPO self-critic every 5 steps
+
+**Key changes from Frank's implementation:**
+- Replaced `compute_score_with_tools` (clipped [0,1] shaping) with `compute_hierarchical_reward` (Tool-Star eq. 3: -1/0/1.0/1.1)
+- Removed DSPy failure analysis / FailureDatabase complexity
+- Added true DPO self-critic (eq. 5) with preference pairs from self-sampling
+- Added `--self_critic` flag — when disabled, runs vanilla RLOO + hierarchical reward
+
+### Run 12: Phase 1 — RLOO + Hierarchical Reward
+- **Date**: 2026-06-02
+- **Base model**: Best v2 SFT checkpoint (calc_only_from_sft v2)
+- **Reward**: Hierarchical (Tool-Star eq. 3): -1 (bad format), 0 (format ok, wrong), 1.0 (correct), 1.1 (correct + multi-tool)
+- **Config**: 250 steps, batch=4, group=8, lr=1e-5, entropy=0.01, kl=0.0, calc-only tools
+- **W&B**: `tir_rloo_project` / `phase1_hier_reward`
+- **Status**: PENDING LAUNCH
+
+### Run 13: Phase 2 — RLOO + Hierarchical Reward + DPO Self-Critic
+- **Date**: 2026-06-02
+- **Base model**: Same as Phase 1
+- **Reward**: Same hierarchical reward
+- **Self-critic**: Every 5 steps, sample 8 responses, threshold=1.0, DPO beta=0.1
+- **Config**: Same as Phase 1 + `--self_critic`
+- **W&B**: `tir_rloo_project` / `phase2_self_critic`
+- **Status**: PENDING LAUNCH
 
 ---
 
