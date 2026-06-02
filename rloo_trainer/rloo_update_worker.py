@@ -357,18 +357,21 @@ class RLOOUpdateWorker:
         rejected_is_response_token: np.ndarray,
         chosen_tool_result_mask: Optional[np.ndarray] = None,
         rejected_tool_result_mask: Optional[np.ndarray] = None,
-        beta: float = 0.1,
+        beta: float = 0.3,
+        dpo_lr: float = 5e-7,
+        dpo_epochs: int = 2,
         device: str = 'cuda',
     ) -> dict:
-        """Run one DPO update on preference pairs (self-critic phase).
+        """Run DPO update on preference pairs (self-critic phase).
 
-        Implements DPO loss from Tool-Star eq. 5:
-            L_DPO = -log sigma(beta * (log pi(y_w|x) - log pi(y_l|x)
-                                     - log pi_ref(y_w|x) + log pi_ref(y_l|x)))
+        Uses a separate Adam optimizer with a small LR, following Tool-Star
+        Appendix C.2.  Does NOT touch the RLOO optimizer or scheduler.
 
         Args:
             chosen/rejected_*: Tokenized preferred/dispreferred sequences.
-            beta: DPO temperature parameter.
+            beta: DPO temperature parameter (Tool-Star uses 0.3).
+            dpo_lr: Learning rate for DPO optimizer (Tool-Star uses 5e-7).
+            dpo_epochs: Number of epochs over preference data (Tool-Star uses 2).
         """
         def _seq_logprob(input_ids_np, attention_mask_np, response_mask_np,
                          tool_mask_np, model):
@@ -388,10 +391,6 @@ class RLOOUpdateWorker:
             return (token_lp * shifted_mask).sum(dim=-1)  # [batch]
 
         # Reference model setup.
-        # Per Tool-Star eq. 5: π_ref is the RL-initialized model, fixed
-        # throughout training.  When kl_divergence_coefficient > 0 the worker
-        # already loads a frozen ref_model.  Otherwise we load it from
-        # ref_model_path (the original SFT checkpoint).
         if hasattr(self, 'ref_model'):
             ref_model = self.ref_model
         else:
@@ -407,61 +406,70 @@ class RLOOUpdateWorker:
                     p.requires_grad = False
             ref_model = self._dpo_ref_model
 
-        # Microbatch DPO to avoid OOM — process pairs in chunks
+        # Separate optimizer for DPO — does NOT touch the RLOO optimizer/scheduler
+        dpo_optimizer = torch.optim.Adam(self.model.parameters(), lr=dpo_lr)
+
         n_pairs = chosen_input_ids.shape[0]
-        micro_bs = max(1, min(4, n_pairs))  # 4 pairs per microbatch
+        micro_bs = max(1, min(4, n_pairs))
         n_microbatches = (n_pairs + micro_bs - 1) // micro_bs
 
-        self.optimizer.zero_grad()
         total_loss = 0.0
         all_logits = []
 
-        for mb_idx in range(n_microbatches):
-            start = mb_idx * micro_bs
-            end = min(start + micro_bs, n_pairs)
+        for epoch in range(dpo_epochs):
+            dpo_optimizer.zero_grad()
+            epoch_loss = 0.0
 
-            pi_chosen = _seq_logprob(
-                chosen_input_ids[start:end], chosen_attention_mask[start:end],
-                chosen_is_response_token[start:end],
-                chosen_tool_result_mask[start:end] if chosen_tool_result_mask is not None else None,
-                self.model,
-            )
-            pi_rejected = _seq_logprob(
-                rejected_input_ids[start:end], rejected_attention_mask[start:end],
-                rejected_is_response_token[start:end],
-                rejected_tool_result_mask[start:end] if rejected_tool_result_mask is not None else None,
-                self.model,
-            )
+            for mb_idx in range(n_microbatches):
+                start = mb_idx * micro_bs
+                end = min(start + micro_bs, n_pairs)
 
-            with torch.no_grad():
-                ref_chosen = _seq_logprob(
+                pi_chosen = _seq_logprob(
                     chosen_input_ids[start:end], chosen_attention_mask[start:end],
                     chosen_is_response_token[start:end],
                     chosen_tool_result_mask[start:end] if chosen_tool_result_mask is not None else None,
-                    ref_model,
+                    self.model,
                 )
-                ref_rejected = _seq_logprob(
+                pi_rejected = _seq_logprob(
                     rejected_input_ids[start:end], rejected_attention_mask[start:end],
                     rejected_is_response_token[start:end],
                     rejected_tool_result_mask[start:end] if rejected_tool_result_mask is not None else None,
-                    ref_model,
+                    self.model,
                 )
 
-            mb_logits = beta * (
-                (pi_chosen - ref_chosen) - (pi_rejected - ref_rejected)
-            )
-            mb_loss = -F.logsigmoid(mb_logits).mean() / n_microbatches
-            mb_loss.backward()
+                with torch.no_grad():
+                    ref_chosen = _seq_logprob(
+                        chosen_input_ids[start:end], chosen_attention_mask[start:end],
+                        chosen_is_response_token[start:end],
+                        chosen_tool_result_mask[start:end] if chosen_tool_result_mask is not None else None,
+                        ref_model,
+                    )
+                    ref_rejected = _seq_logprob(
+                        rejected_input_ids[start:end], rejected_attention_mask[start:end],
+                        rejected_is_response_token[start:end],
+                        rejected_tool_result_mask[start:end] if rejected_tool_result_mask is not None else None,
+                        ref_model,
+                    )
 
-            total_loss += mb_loss.item()
-            all_logits.append(mb_logits.detach())
+                mb_logits = beta * (
+                    (pi_chosen - ref_chosen) - (pi_rejected - ref_rejected)
+                )
+                mb_loss = -F.logsigmoid(mb_logits).mean() / n_microbatches
+                mb_loss.backward()
 
-        if self.gradient_clipping > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=self.gradient_clipping
-            )
-        self.optimizer.step()
-        self.scheduler.step()
+                epoch_loss += mb_loss.item()
+                if epoch == dpo_epochs - 1:
+                    all_logits.append(mb_logits.detach())
+
+            if self.gradient_clipping > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=self.gradient_clipping
+                )
+            dpo_optimizer.step()
+            total_loss += epoch_loss
+
+        # Clean up DPO optimizer to free memory
+        del dpo_optimizer
 
         all_logits = torch.cat(all_logits)
         with torch.no_grad():
@@ -469,7 +477,7 @@ class RLOOUpdateWorker:
             reward_margin = (all_logits / beta).mean().item()
 
         return {
-            'dpo_loss': total_loss,
+            'dpo_loss': total_loss / dpo_epochs,
             'dpo_reward_margin': reward_margin,
             'dpo_accuracy': accuracy,
             'dpo_n_pairs': n_pairs,

@@ -86,14 +86,17 @@ run_phase1() {
 }
 
 run_phase2() {
-    echo "=== Phase 2: RLOO + Hierarchical Reward + DPO Self-Critic ==="
-    MODAL_APP_NAME="rloo-sc" \
+    local suffix="${1:-}"
+    local app_name="rloo-sc${suffix:+-$suffix}"
+    local wandb_name="rloo_sc${suffix:+_$suffix}"
+    echo "=== Phase 2: RLOO + Hierarchical Reward + DPO Self-Critic (${app_name}) ==="
+    MODAL_APP_NAME="$app_name" \
     modal run --detach "$PROJECT_ROOT/modal_train.py" tir_rloo -- \
         --model_name "$MODEL_NAME" \
         --dataset_name "$DATASET_NAME" \
         --save_dir "$SAVE_DIR" \
         --wandb_project "$WANDB_PROJECT" \
-        --wandb_name "rloo_sc" \
+        --wandb_name "$wandb_name" \
         --num_training_steps "$NUM_STEPS" \
         --batch_size "$BATCH_SIZE" \
         --group_size "$GROUP_SIZE" \
@@ -110,23 +113,25 @@ run_phase2() {
         --self_critic \
         --self_critic_every_k 5 \
         --self_critic_n_samples 8 \
-        --self_critic_beta 0.1
+        --self_critic_beta 0.3
 }
+
+SUFFIX="${2:-}"
 
 case "$PHASE" in
     vanilla) run_vanilla ;;
     phase1) run_phase1 ;;
-    phase2) run_phase2 ;;
+    phase2) run_phase2 "$SUFFIX" ;;
     both)
         run_phase1
-        run_phase2
+        run_phase2 "$SUFFIX"
         ;;
     all)
         run_vanilla
         run_phase1
-        run_phase2
+        run_phase2 "$SUFFIX"
         ;;
-    *) echo "Usage: $0 [vanilla|phase1|phase2|both|all]"; exit 1 ;;
+    *) echo "Usage: $0 [vanilla|phase1|phase2|both|all] [suffix]"; exit 1 ;;
 esac
 
 echo ""

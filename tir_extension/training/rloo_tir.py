@@ -72,7 +72,7 @@ class TIRRLOOTrainer(RLOOTrainer):
         self_critic: bool = False,
         self_critic_every_k: int = 5,
         self_critic_n_samples: int = 8,
-        self_critic_beta: float = 0.1,
+        self_critic_beta: float = 0.3,
         self_critic_threshold: float = 1.0,
         # Everything else forwarded to RLOOTrainer.
         **rloo_kwargs,
@@ -703,7 +703,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Run self-critic every k RLOO steps.")
     parser.add_argument("--self_critic_n_samples", type=int, default=8,
                         help="Number of responses to sample per prompt for self-critic.")
-    parser.add_argument("--self_critic_beta", type=float, default=0.1,
+    parser.add_argument("--self_critic_beta", type=float, default=0.3,
                         help="DPO temperature parameter for self-critic.")
     parser.add_argument("--self_critic_threshold", type=float, default=1.0,
                         help="Reward threshold for positive/negative labeling.")
