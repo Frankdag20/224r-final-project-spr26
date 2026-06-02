@@ -387,50 +387,74 @@ class RLOOUpdateWorker:
             )
             return (token_lp * shifted_mask).sum(dim=-1)  # [batch]
 
-        # Policy log-probs
-        pi_chosen = _seq_logprob(
-            chosen_input_ids, chosen_attention_mask,
-            chosen_is_response_token, chosen_tool_result_mask, self.model,
-        )
-        pi_rejected = _seq_logprob(
-            rejected_input_ids, rejected_attention_mask,
-            rejected_is_response_token, rejected_tool_result_mask, self.model,
-        )
-
-        # Reference log-probs (no grad).
+        # Reference model setup.
         # Per Tool-Star eq. 5: π_ref is the RL-initialized model, fixed
         # throughout training.  When kl_divergence_coefficient > 0 the worker
-        # already loads a frozen ref_model.  Otherwise we snapshot the
-        # *current* policy weights as a frozen copy so the DPO baseline is
-        # meaningful (using self.model would give ref == policy → loss = log2).
-        with torch.no_grad():
-            if hasattr(self, 'ref_model'):
-                ref_model = self.ref_model
-            else:
-                # Lazy-create a frozen snapshot on first DPO call
-                if not hasattr(self, '_dpo_ref_model'):
-                    import copy
-                    self._dpo_ref_model = copy.deepcopy(self.model)
-                    self._dpo_ref_model.eval()
-                    for p in self._dpo_ref_model.parameters():
-                        p.requires_grad = False
-                ref_model = self._dpo_ref_model
-            ref_chosen = _seq_logprob(
-                chosen_input_ids, chosen_attention_mask,
-                chosen_is_response_token, chosen_tool_result_mask, ref_model,
+        # already loads a frozen ref_model.  Otherwise we load it from
+        # ref_model_path (the original SFT checkpoint).
+        if hasattr(self, 'ref_model'):
+            ref_model = self.ref_model
+        else:
+            if not hasattr(self, '_dpo_ref_model'):
+                print(f"[DPO] Loading reference model from {self.ref_model_path}",
+                      flush=True)
+                self._dpo_ref_model = AutoModelForCausalLM.from_pretrained(
+                    self.ref_model_path,
+                    torch_dtype=torch.bfloat16,
+                ).to(device)
+                self._dpo_ref_model.eval()
+                for p in self._dpo_ref_model.parameters():
+                    p.requires_grad = False
+            ref_model = self._dpo_ref_model
+
+        # Microbatch DPO to avoid OOM — process pairs in chunks
+        n_pairs = chosen_input_ids.shape[0]
+        micro_bs = max(1, min(4, n_pairs))  # 4 pairs per microbatch
+        n_microbatches = (n_pairs + micro_bs - 1) // micro_bs
+
+        self.optimizer.zero_grad()
+        total_loss = 0.0
+        all_logits = []
+
+        for mb_idx in range(n_microbatches):
+            start = mb_idx * micro_bs
+            end = min(start + micro_bs, n_pairs)
+
+            pi_chosen = _seq_logprob(
+                chosen_input_ids[start:end], chosen_attention_mask[start:end],
+                chosen_is_response_token[start:end],
+                chosen_tool_result_mask[start:end] if chosen_tool_result_mask is not None else None,
+                self.model,
             )
-            ref_rejected = _seq_logprob(
-                rejected_input_ids, rejected_attention_mask,
-                rejected_is_response_token, rejected_tool_result_mask, ref_model,
+            pi_rejected = _seq_logprob(
+                rejected_input_ids[start:end], rejected_attention_mask[start:end],
+                rejected_is_response_token[start:end],
+                rejected_tool_result_mask[start:end] if rejected_tool_result_mask is not None else None,
+                self.model,
             )
 
-        # DPO loss: -log sigma(beta * ((pi_w - ref_w) - (pi_l - ref_l)))
-        logits = beta * (
-            (pi_chosen - ref_chosen) - (pi_rejected - ref_rejected)
-        )
-        dpo_loss = -F.logsigmoid(logits).mean()
+            with torch.no_grad():
+                ref_chosen = _seq_logprob(
+                    chosen_input_ids[start:end], chosen_attention_mask[start:end],
+                    chosen_is_response_token[start:end],
+                    chosen_tool_result_mask[start:end] if chosen_tool_result_mask is not None else None,
+                    ref_model,
+                )
+                ref_rejected = _seq_logprob(
+                    rejected_input_ids[start:end], rejected_attention_mask[start:end],
+                    rejected_is_response_token[start:end],
+                    rejected_tool_result_mask[start:end] if rejected_tool_result_mask is not None else None,
+                    ref_model,
+                )
 
-        dpo_loss.backward()
+            mb_logits = beta * (
+                (pi_chosen - ref_chosen) - (pi_rejected - ref_rejected)
+            )
+            mb_loss = -F.logsigmoid(mb_logits).mean() / n_microbatches
+            mb_loss.backward()
+
+            total_loss += mb_loss.item()
+            all_logits.append(mb_logits.detach())
 
         if self.gradient_clipping > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -438,17 +462,15 @@ class RLOOUpdateWorker:
             )
         self.optimizer.step()
         self.scheduler.step()
-        self.optimizer.zero_grad()
 
+        all_logits = torch.cat(all_logits)
         with torch.no_grad():
-            chosen_rewards = beta * (pi_chosen - ref_chosen)
-            rejected_rewards = beta * (pi_rejected - ref_rejected)
-            reward_margin = (chosen_rewards - rejected_rewards).mean().item()
-            accuracy = (logits > 0).float().mean().item()
+            accuracy = (all_logits > 0).float().mean().item()
+            reward_margin = (all_logits / beta).mean().item()
 
         return {
-            'dpo_loss': dpo_loss.item(),
+            'dpo_loss': total_loss,
             'dpo_reward_margin': reward_margin,
             'dpo_accuracy': accuracy,
-            'dpo_n_pairs': chosen_input_ids.shape[0],
+            'dpo_n_pairs': n_pairs,
         }

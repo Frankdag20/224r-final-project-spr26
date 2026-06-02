@@ -259,6 +259,12 @@ class TIRSamplingWorker:
 
                     # Update context for next turn
                     contexts[idx] = expanded_prompts[idx] + generated_texts[idx]
+
+                    # Check if context exceeds max_model_len — stop if so
+                    ctx_tokens = len(self.tokenizer.encode(contexts[idx]))
+                    if ctx_tokens >= self.max_model_len - 10:
+                        finished[idx] = True
+                        continue
                 else:
                     # Stopped for another reason (max tokens, etc.)
                     finished[idx] = True

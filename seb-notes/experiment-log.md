@@ -234,22 +234,26 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0%
 - Added true DPO self-critic (eq. 5) with preference pairs from self-sampling
 - Added `--self_critic` flag — when disabled, runs vanilla RLOO + hierarchical reward
 
-### Run 12: Phase 1 — RLOO + Hierarchical Reward
+### Run 12: RLOO No Self-Critic — RLOO + Hierarchical Reward
 - **Date**: 2026-06-02
-- **Base model**: Best v2 SFT checkpoint (calc_only_from_sft v2)
+- **Base model**: `sbfisher/tir-sft-3tool_from_sft` (best v2 SFT, 58.0% pass@1 with tools)
 - **Reward**: Hierarchical (Tool-Star eq. 3): -1 (bad format), 0 (format ok, wrong), 1.0 (correct), 1.1 (correct + multi-tool)
-- **Config**: 250 steps, batch=4, group=8, lr=1e-5, entropy=0.01, kl=0.0, calc-only tools
-- **W&B**: `tir_rloo_project` / `phase1_hier_reward`
-- **Status**: PENDING LAUNCH
+- **Config**: 250 steps, batch=4, group=8, grad_accum=4, lr=1e-5, entropy=0.01, kl=0.0, 3-tool (calculator,number_tracker,running_total), max_tool_turns=5
+- **W&B**: `tir_rloo_project` / `rloo_nosc`
+- **Modal**: https://modal.com/apps/sebastianfisher/main/ap-f8JY9gb4Hl9TfjwtGZ7Zct
+- **Status**: RUNNING (step 0-1 completed, reward_mean=-0.525 at step 0)
+- **Notes**: First launch OOM'd with grad_accum=1 (32 seqs in one forward pass). Fixed with grad_accum=4.
 
-### Run 13: Phase 2 — RLOO + Hierarchical Reward + DPO Self-Critic
+### Run 13: RLOO Self-Critic — RLOO + Hierarchical Reward + DPO Self-Critic
 - **Date**: 2026-06-02
-- **Base model**: Same as Phase 1
+- **Base model**: `sbfisher/tir-sft-3tool_from_sft` (same as Run 12)
 - **Reward**: Same hierarchical reward
 - **Self-critic**: Every 5 steps, sample 8 responses, threshold=1.0, DPO beta=0.1
-- **Config**: Same as Phase 1 + `--self_critic`
-- **W&B**: `tir_rloo_project` / `phase2_self_critic`
-- **Status**: PENDING LAUNCH
+- **Config**: Same as Run 12 + `--self_critic --self_critic_every_k 5 --self_critic_n_samples 8 --self_critic_beta 0.1`
+- **W&B**: `tir_rloo_project` / `rloo_sc`
+- **Modal**: https://modal.com/apps/sebastianfisher/main/ap-QoGx68LS7vFYkS5P53pRNE
+- **Status**: RUNNING (step 9, DPO self-critic triggering every 5 steps)
+- **DPO Bug (FIXED in code, not yet deployed)**: DPO loss was always log(2) because the ref model was a deepcopy of the current policy (ref==policy→logits=0). Fixed to load original SFT model as ref instead. Current run effectively identical to nosc (DPO is a no-op). Will need relaunch for proper self-critic.
 
 ---
 

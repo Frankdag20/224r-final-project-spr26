@@ -32,6 +32,7 @@ if PROJECT_ROOT not in sys.path:
 
 warnings.filterwarnings("ignore")
 
+from evaluation.countdown import compute_score
 from rloo_trainer.rloo import RLOOTrainer
 from tir_extension.tools.tool_pool import (
     execute_tool_calls,
@@ -65,6 +66,8 @@ class TIRRLOOTrainer(RLOOTrainer):
         max_tool_turns: int = 5,
         multi_tool_bonus: float = 0.1,
         min_tools_for_bonus: int = 2,
+        # Reward mode
+        use_vanilla_reward: bool = False,
         # Self-critic config (Tool-Star Algorithm 1)
         self_critic: bool = False,
         self_critic_every_k: int = 5,
@@ -79,6 +82,7 @@ class TIRRLOOTrainer(RLOOTrainer):
         self.max_tool_turns = max_tool_turns
         self.multi_tool_bonus = multi_tool_bonus
         self.min_tools_for_bonus = min_tools_for_bonus
+        self.use_vanilla_reward = use_vanilla_reward
         self.self_critic = self_critic
         self.self_critic_every_k = self_critic_every_k
         self.self_critic_n_samples = self_critic_n_samples
@@ -101,6 +105,7 @@ class TIRRLOOTrainer(RLOOTrainer):
         )
         print(f"[TIR] Tool system prompt (I^T):\n{self._tool_system_prompt}\n")
         print(f"[TIR] Active tools: {sorted(self.active_tools)}")
+        print(f"[TIR] Reward mode: {'vanilla (compute_score)' if self.use_vanilla_reward else 'hierarchical'}")
         print(f"[TIR] Self-critic: {self.self_critic}")
         if self.self_critic:
             print(f"[TIR] Self-critic every {self.self_critic_every_k} steps, "
@@ -108,6 +113,7 @@ class TIRRLOOTrainer(RLOOTrainer):
 
         self.wandb.config.update({
             "tir_active_tools": sorted(self.active_tools),
+            "tir_use_vanilla_reward": use_vanilla_reward,
             "tir_multi_tool_bonus": multi_tool_bonus,
             "tir_min_tools_for_bonus": min_tools_for_bonus,
             "tir_self_critic": self_critic,
@@ -462,21 +468,37 @@ class TIRRLOOTrainer(RLOOTrainer):
                     self.sampling_worker.generate.remote(all_prompts)
                 )
 
-                # ----- 2) Hierarchical rewards (Tool-Star eq. 3) -----
+                # ----- 2) Rewards -----
                 all_rewards: list[list[float]] = []
                 all_meta: list[dict] = []
                 for resp_group, gt in zip(all_responses, all_ground_truth):
                     group_rewards = []
                     for resp in resp_group:
-                        reward, meta = compute_hierarchical_reward(
-                            response=resp,
-                            ground_truth=gt,
-                            active_tools=self.active_tools,
-                            multi_tool_bonus=self.multi_tool_bonus,
-                            min_tools_for_bonus=self.min_tools_for_bonus,
-                        )
-                        group_rewards.append(reward)
-                        all_meta.append(meta)
+                        if self.use_vanilla_reward:
+                            # Vanilla compute_score: 0.0 / 0.1 / 1.0
+                            base = compute_score(resp, gt)
+                            group_rewards.append(base)
+                            all_meta.append({
+                                "base_score": base,
+                                "final_reward": base,
+                                "good_format": base > 0.0,
+                                "accuracy": 1.0 if base >= 1.0 else 0.0,
+                                "rM": 0.0,
+                                "distinct_relevant_tools": [],
+                                "n_distinct_relevant_tools": 0,
+                                "n_total_tool_calls": 0,
+                            })
+                        else:
+                            # Hierarchical reward (Tool-Star eq. 3)
+                            reward, meta = compute_hierarchical_reward(
+                                response=resp,
+                                ground_truth=gt,
+                                active_tools=self.active_tools,
+                                multi_tool_bonus=self.multi_tool_bonus,
+                                min_tools_for_bonus=self.min_tools_for_bonus,
+                            )
+                            group_rewards.append(reward)
+                            all_meta.append(meta)
                     all_rewards.append(group_rewards)
 
                 reward_mean = float(np.mean(all_rewards))
@@ -584,12 +606,19 @@ class TIRRLOOTrainer(RLOOTrainer):
 
                 # ----- 7) Logging -----
                 hier_metrics = aggregate_hierarchical_metrics(all_meta)
+                # Vanilla-compatible accuracy: fraction of rollouts with
+                # base_score == 1.0 (same as what vanilla RLOO tracks via
+                # reward_mean when compute_score returns 0/0.1/1.0).
+                rollout_accuracy = float(
+                    np.mean([1.0 if m["base_score"] >= 1.0 else 0.0 for m in all_meta])
+                )
                 log_dict = {
                     "train/epoch": epoch,
                     "train/train_iter": train_iter,
                     "train/global_step": global_step,
                     "sampling/reward_mean": reward_mean,
                     "sampling/base_score_mean": base_score_mean,
+                    "sampling/rollout_accuracy": rollout_accuracy,
                     **{f"train/{k}": v for k, v in all_metrics.items()},
                     **hier_metrics,
                 }
@@ -633,7 +662,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_schedule", type=str, default="constant")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--warmup_ratio", type=float, default=0.0)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--group_size", type=int, default=2)
     parser.add_argument("--entropy_coefficient", type=float, default=0.01)
@@ -664,6 +693,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_tool_turns", type=int, default=5)
     parser.add_argument("--multi_tool_bonus", type=float, default=0.1)
     parser.add_argument("--min_tools_for_bonus", type=int, default=2)
+    parser.add_argument("--use_vanilla_reward", action="store_true",
+                        help="Use vanilla compute_score (0/0.1/1.0) instead of hierarchical reward.")
 
     # Self-critic (Tool-Star Algorithm 1)
     parser.add_argument("--self_critic", action="store_true",
@@ -696,6 +727,7 @@ def main():
         "max_tool_turns": args.max_tool_turns,
         "multi_tool_bonus": args.multi_tool_bonus,
         "min_tools_for_bonus": args.min_tools_for_bonus,
+        "use_vanilla_reward": args.use_vanilla_reward,
         "self_critic": args.self_critic,
         "self_critic_every_k": args.self_critic_every_k,
         "self_critic_n_samples": args.self_critic_n_samples,
