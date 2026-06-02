@@ -40,6 +40,19 @@ def metrics(f):
                 tool_use=100*sum('<use_tool>' in r for r in rp)/len(rp),
                 mean_calls=sum(r.count('<use_tool>') for r in rp)/len(rp))
 
+def passk(f, ks=(1,2,4,8,16)):
+    from math import comb
+    rows=load_eval(f)
+    if rows is None: return None
+    out={}
+    for k in ks:
+        vals=[]
+        for r in rows:
+            n=len(r['scores']); c=sum(1 for s in r['scores'] if s==1.0)
+            vals.append(1.0 if n-c<k else 1.0-comb(n-c,k)/comb(n,k))
+        out[k]=100*sum(vals)/len(vals)
+    return out
+
 def tool_metrics(f):
     rows=load_eval(f)
     if rows is None: return None
@@ -175,15 +188,60 @@ axes[0].set_ylabel('Total tool calls')
 fig.suptitle('Per-tool call counts (teal=relevant, red=distractor) -- distractors avoided',fontweight='bold')
 plt.tight_layout(); plt.savefig(f'{FIG_DIR}/per_tool.png',dpi=150,bbox_inches='tight'); plt.show()"""))
 
-cells.append(md("""## 5. Summary & findings
+cells.append(md("""## 5. Pass@k: latent capability vs. reliability
+
+`pass@k` is the chance that >=1 of k samples is correct (unbiased estimator over
+the 16 samples/prompt). The gap between pass@1 and pass@16 is *latent capability*
+the model has but cannot reliably surface. ReST distillation **trades diversity
+for reliability**: it raises pass@1 while flattening the curve (lower pass@16),
+concentrating probability mass onto correct solutions."""))
+
+cells.append(code(r"""ks=[1,2,4,8,16]
+pk_methods=[('TIR SFT','tir_sft_eval_multiturn.json',CARDINAL),
+            ('IPO','ipo_v3_eval_multiturn.json',GOLD),
+            ('ReST round 2',resolve('rest_v4_eval_multiturn.json') or 'rest_v4_eval_multiturn.json',TEAL),
+            ('RLOO + Self-Critic',RL_FILES['RL_SC'],NAVY)]
+fig,ax=plt.subplots(figsize=(8,5))
+print(f"{'Method':<22}" + ''.join(f'p@{k:<5}' for k in ks))
+print('-'*54)
+for name,f,c in pk_methods:
+    pk=passk(f)
+    if not pk: continue
+    ax.plot(ks,[pk[k] for k in ks],'o-',color=c,lw=2,ms=7,label=name)
+    print(f"{name:<22}" + ''.join(f'{pk[k]:<6.1f}' for k in ks))
+ax.set_xscale('log',base=2); ax.set_xticks(ks); ax.set_xticklabels(ks)
+ax.set_xlabel('k (samples)'); ax.set_ylabel('Pass@k (%)')
+ax.set_title('Pass@k: latent capability vs reliability',fontweight='bold')
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig(f'{FIG_DIR}/pass_at_k.png',dpi=150,bbox_inches='tight'); plt.show()"""))
+
+cells.append(code(r"""# pass@1 vs pass@16 gap: how much latent capability is unrealised
+gnames=[]; g1=[]; g16=[]
+for name,f in [('TIR SFT','tir_sft_eval_multiturn.json'),('IPO','ipo_v3_eval_multiturn.json'),
+               ('ReST r1','rest_v3_eval_multiturn.json'),('ReST r2','rest_v4_eval_multiturn.json'),
+               ('RLOO+SC',RL_FILES['RL_SC'])]:
+    pk=passk(f)
+    if pk: gnames.append(name); g1.append(pk[1]); g16.append(pk[16])
+x=np.arange(len(gnames)); w=0.38
+fig,ax=plt.subplots(figsize=(9,4.5))
+ax.bar(x-w/2,g1,w,label='pass@1 (reliability)',color=TEAL)
+ax.bar(x+w/2,g16,w,label='pass@16 (capability)',color='#bbbbbb')
+for i in range(len(gnames)):
+    ax.annotate(f'gap {g16[i]-g1[i]:.0f}',xy=(x[i],g16[i]),xytext=(0,4),textcoords='offset points',ha='center',fontsize=8)
+ax.set_xticks(x); ax.set_xticklabels(gnames); ax.set_ylabel('%'); ax.legend()
+ax.set_title('pass@1 vs pass@16 (smaller gap = better-calibrated)',fontweight='bold'); ax.grid(axis='y',alpha=0.3)
+plt.tight_layout(); plt.savefig(f'{FIG_DIR}/passk_gap.png',dpi=150,bbox_inches='tight'); plt.show()"""))
+
+cells.append(md("""## 6. Summary & findings
 
 Computed from real eval data above:
 
 1. **Multi-turn tool execution** is the dominant inference-time lever (~+10pp over single-turn for SFT).
 2. **Offline preference learning (IPO)** plateaus at the SFT ceiling -- cannot exceed its generator.
 3. **Rejection-sampling distillation (ReST), iterated (ReST-EM)** breaks the ceiling: SFT -> round 1 -> round 2 climbs by distilling pass@k capability into pass@1.
-4. **Online multi-turn RL** (RLOO / self-critic / curriculum) is competitive at its best checkpoint -- self-critic slightly beats SFT -- but unstable: long runs over-train and collapse (best vs final checkpoint differs by 15-25pp).
-5. **Tool selection works**: the 3 distractor tools are essentially never invoked; models concentrate on the calculator, and stronger ReST models use fewer, more targeted calls."""))
+4. **Online multi-turn RL** (RLOO / self-critic / curriculum) is competitive at its best checkpoint -- self-critic slightly beats SFT -- but unstable: long runs over-train and collapse (best vs final checkpoint differs by 15-25pp). Adding tools makes the RL objective *harder* at 0.5B (longer multi-turn rollouts, masked tool tokens, shaped -1 reward), so tool-RLOO does not beat a clean text-only RLOO baseline.
+5. **Tool selection works**: the 3 distractor tools are essentially never invoked; models concentrate on the calculator, and stronger ReST models use fewer, more targeted calls.
+6. **Pass@k**: every method has a large pass@1->pass@16 gap (20-29pp of unrealised capability). ReST distillation narrows this gap -- it raises pass@1 by concentrating mass on correct solutions, at a small cost to pass@16 diversity."""))
 
 nb={"cells":cells,"metadata":{"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"},
     "language_info":{"name":"python","version":"3.11"}},"nbformat":4,"nbformat_minor":5}

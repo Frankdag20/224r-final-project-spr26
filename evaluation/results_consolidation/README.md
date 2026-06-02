@@ -31,12 +31,22 @@ jupyter nbconvert --to notebook --execute --inplace results_consolidation.ipynb
 All methods build on the same SFT warm-start (`tir_sft_run2`, trained on
 `tir_trajectories_2000.json`).
 
+## Figures (in `figures/`)
+- `headline.png` — multi-turn Pass@1 across all 7 methods
+- `single_vs_multi.png` — +10.7pp tool-execution effect
+- `restem.png` — ReST-EM iteration curve
+- `tool_use.png` — any-tool vs multi-tool collaboration
+- `per_tool.png` — per-tool call counts (distractors avoided)
+- `pass_at_k.png` — pass@k curves (latent capability vs reliability)
+- `passk_gap.png` — pass@1 vs pass@16 gap per method
+
 ## Findings
 1. **Multi-turn tool execution** is the dominant inference lever (~+10pp over single-turn).
 2. **IPO** plateaus at the SFT ceiling — offline preference learning cannot exceed its generator.
 3. **ReST-EM** breaks the ceiling (+5.8pp) by distilling pass@k capability into pass@1.
-4. **Online RL** is competitive at its best checkpoint (self-critic beats SFT) but over-trains/collapses on long runs.
+4. **Online RL** is competitive at its best checkpoint (self-critic beats SFT) but over-trains/collapses on long runs. Adding tools makes the RL objective harder at 0.5B, so tool-RLOO does not beat a clean text-only RLOO baseline.
 5. **Tool selection works** — the 3 distractor tools are essentially never invoked.
+6. **Pass@k**: every method leaves 20–29pp of latent capability on the table (pass@1 vs pass@16). ReST narrows this gap — higher pass@1 at a small cost to pass@16 diversity (the distillation/sharpening signature).
 
 ## Data file → method map
 | File | Method / regime |
