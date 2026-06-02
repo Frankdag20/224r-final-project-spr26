@@ -35,6 +35,7 @@ for run in "${RUNS[@]}"; do
     model_path="${CHECKPOINT_BASE}/${run}/model"
 
     echo "=== Evaluating ${run} WITH tools ==="
+    MODAL_APP_NAME="eval-${run}-tools" \
     modal run --detach "$PROJECT_ROOT/modal_train.py" eval_tir -- \
         --model_path "$model_path" \
         --eval_dataset "$EVAL_DATASET" \
@@ -42,6 +43,7 @@ for run in "${RUNS[@]}"; do
         --output_name "${run}_with_tools"
 
     echo "=== Evaluating ${run} WITHOUT tools ==="
+    MODAL_APP_NAME="eval-${run}-no-tools" \
     modal run --detach "$PROJECT_ROOT/modal_train.py" eval_tir -- \
         --model_path "$model_path" \
         --eval_dataset "$EVAL_DATASET" \
