@@ -36,24 +36,35 @@ def _load_records(json_path: str) -> list[dict]:
     return records
 
 
-def _apply_chat_template(tokenizer, prompt: str, completion: str) -> tuple[str, str]:
-    """Format ``prompt``/``completion`` with the model's chat template."""
-    prompt_only = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-    full = tokenizer.apply_chat_template(
-        [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": completion},
-        ],
-        add_generation_prompt=False,
-        tokenize=False,
-    )
-    if prompt_only not in full:
-        raise ValueError("Chat template did not preserve the prompt prefix")
-    response_text = full[len(prompt_only):]
+_OLD_SYSTEM = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
+_ASSISTANT_GEN_PROMPT = "\n<|im_start|>assistant\n"
+_EOS = "<|im_end|>"
+
+
+def _apply_chat_template(
+    tokenizer, prompt: str, completion: str, system_prompt: str | None = None,
+) -> tuple[str, str]:
+    """Split an already chat-templated ``prompt`` and ``completion`` into
+    (prompt_text, response_text) suitable for tokenisation.
+
+    The trajectory prompts from ``generate_trajectories.py`` are already
+    chat-formatted (``<|im_start|>system ...``).  We handle them directly
+    rather than re-wrapping via ``apply_chat_template``, which would
+    double-nest the special tokens.
+
+    When ``system_prompt`` is provided we replace the default system message
+    with the tool-integrated instruction (I^T).
+    """
+    if system_prompt and _OLD_SYSTEM in prompt:
+        new_system = f"<|im_start|>system\n{system_prompt}<|im_end|>"
+        prompt = prompt.replace(_OLD_SYSTEM, new_system, 1)
+
+    # The prompt already ends with "<|im_start|>assistant\n" (generation prompt).
+    # The completion is the raw assistant text.  We just need to add the EOS.
+    prompt_only = prompt
+    if not prompt_only.endswith(_ASSISTANT_GEN_PROMPT):
+        prompt_only = prompt_only.rstrip() + _ASSISTANT_GEN_PROMPT
+    response_text = completion + _EOS
     return prompt_only, response_text
 
 
@@ -102,6 +113,7 @@ class SFTToolTrajectoryDataset(TorchDataset):
         max_response_length: int = 1024,
         keep_only_full_score: bool = True,
         min_score: float = 1.0,
+        system_prompt: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
@@ -117,6 +129,7 @@ class SFTToolTrajectoryDataset(TorchDataset):
                 tokenizer,
                 rec["prompt"],
                 rec["completion"],
+                system_prompt=system_prompt,
             )
             cleaned.append(
                 {
@@ -208,6 +221,7 @@ def get_dataloaders(
     val_fraction: float = 0.1,
     seed: int = 0,
     gradient_accumulation_steps: int = 1,
+    system_prompt: str | None = None,
 ) -> dict[str, DataLoader]:
     """Split the trajectory file into train/test DataLoaders."""
     assert batch_size % gradient_accumulation_steps == 0
@@ -219,6 +233,7 @@ def get_dataloaders(
         max_prompt_length=max_prompt_length,
         max_response_length=max_response_length,
         keep_only_full_score=keep_only_full_score,
+        system_prompt=system_prompt,
     )
 
     if val_fraction <= 0 or len(full) < 2:

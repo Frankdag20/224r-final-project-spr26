@@ -131,6 +131,61 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0% (`eval_results/sf
 
 ---
 
+## Runs 8-11: TIR SFT v2 — with tool-integrated instruction (I^T)
+
+**Motivation:** Runs 4-7 were missing the tool-integrated system prompt (I^T) from the Tool-Star paper (eq. 1). The model was trained with a generic "You are a helpful assistant." system message, meaning it never received explicit instructions about what tools are available or how to call them. This is inconsistent with the Tool-Star formalization where I^T conditions generation at all stages.
+
+**What changed:**
+- System prompt now describes the Countdown task, lists available tools with descriptions, shows the `<use_tool>` / `<tool_result>` format with a worked example
+- I^T is injected consistently across SFT, RLOO, and eval (previously only eval had it, and even that was unused)
+- Calc-only runs get a calc-only I^T (via `--active_tools calculator`); 3-tool runs get the full 3-tool I^T
+- Also fixed: SFT dataset was double-wrapping chat template tokens — now handles already-templated prompts correctly
+
+**W&B project:** `tir_sft_project_v2` (old results preserved in `tir_sft_project`)
+**Checkpoints:** `/vol/checkpoints/tir_sft_checkpoints/tir_sft_project_v2/` (old preserved in `tir_sft_project/`)
+
+### Run 8: TIR SFT v2 — 3-tool, from vanilla SFT checkpoint
+- **Date**: 2026-06-01
+- **Base model**: `asingh15/qwen-sft-countdown-defaultproj`
+- **Dataset**: `tir_trajectories_2000.json` (1707 trajectories, 3 tools)
+- **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048, warmup_ratio=0.05
+- **I^T**: 3-tool system prompt (calculator, number_tracker, running_total)
+- **W&B**: `tir_sft_project_v2` / `3tool_from_sft`
+- **HF repo**: `sbfisher/tir-sft-3tool_from_sft`
+- **Status**: RUNNING (Modal, detached)
+
+### Run 9: TIR SFT v2 — 3-tool, from base Qwen (cold start)
+- **Date**: 2026-06-01
+- **Base model**: `Qwen/Qwen2.5-0.5B`
+- **Dataset**: `tir_trajectories_2000.json` (1707 trajectories, 3 tools)
+- **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048, warmup_ratio=0.05
+- **I^T**: 3-tool system prompt
+- **W&B**: `tir_sft_project_v2` / `3tool_from_base`
+- **HF repo**: `sbfisher/tir-sft-3tool_from_base`
+- **Status**: RUNNING (Modal, detached)
+
+### Run 10: TIR SFT v2 — calculator-only, from vanilla SFT checkpoint
+- **Date**: 2026-06-01
+- **Base model**: `asingh15/qwen-sft-countdown-defaultproj`
+- **Dataset**: `tir_trajectories_calc_only.json` (1699 trajectories, calculator only)
+- **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048, warmup_ratio=0.05
+- **I^T**: calculator-only system prompt (`--active_tools calculator`)
+- **W&B**: `tir_sft_project_v2` / `calc_only_from_sft`
+- **HF repo**: `sbfisher/tir-sft-calc_only_from_sft`
+- **Status**: RUNNING (Modal, detached)
+
+### Run 11: TIR SFT v2 — calculator-only, from base Qwen (cold start)
+- **Date**: 2026-06-01
+- **Base model**: `Qwen/Qwen2.5-0.5B`
+- **Dataset**: `tir_trajectories_calc_only.json` (1699 trajectories, calculator only)
+- **Config**: lr=1e-5, 10 epochs, batch=16 (8x2), max_response_length=2048, warmup_ratio=0.05
+- **I^T**: calculator-only system prompt (`--active_tools calculator`)
+- **W&B**: `tir_sft_project_v2` / `calc_only_from_base`
+- **HF repo**: `sbfisher/tir-sft-calc_only_from_base`
+- **Status**: RUNNING (Modal, detached)
+
+---
+
 ## Prior Data (from Mahmood's branch `tir_extension_mih`)
 - `tir_trajectories.json`: 414 trajectories, all score=1.0, all with tool calls
   - Tool usage: calculator (559 calls), number_tracker (90), running_total (34)

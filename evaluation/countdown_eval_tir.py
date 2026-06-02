@@ -159,6 +159,9 @@ def parse_args():
     parser.add_argument("--max_tool_turns", type=int, default=5)
     parser.add_argument("--no_tools", action="store_true",
                         help="Disable tool execution (baseline comparison)")
+    parser.add_argument("--active_tools", type=str, default=None,
+                        help="Comma-separated tool names for I^T prompt. "
+                             "Default: all relevant tools. Use 'calculator' for calc-only.")
     return parser.parse_args()
 
 
@@ -176,9 +179,25 @@ if __name__ == "__main__":
 
     loaded_dataset = load_dataset(args.eval_dataset, split="test")
     prompt_df = loaded_dataset.to_pandas()
-    prompts = list(prompt_df["prompt"])
+    prompts_raw = list(prompt_df["prompt"])
 
-    active_tools = set() if args.no_tools else relevant_tool_names()
+    if args.active_tools:
+        active_tools = set(args.active_tools.split(","))
+    else:
+        active_tools = set() if args.no_tools else relevant_tool_names()
+
+    if not args.no_tools:
+        # Inject tool-integrated instruction (I^T) into prompts.
+        tool_sys = build_tool_system_prompt(active_tools=active_tools)
+        old_sys = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
+        new_sys = f"<|im_start|>system\n{tool_sys}<|im_end|>"
+        prompts = [
+            p.replace(old_sys, new_sys, 1) if old_sys in p else new_sys + "\n" + p
+            for p in prompts_raw
+        ]
+        print(f"Injected tool system prompt (I^T) into {len(prompts)} prompts")
+    else:
+        prompts = prompts_raw
 
     if args.no_tools:
         # Single-pass generation (same as baseline countdown_eval.py)

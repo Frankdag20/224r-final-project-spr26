@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-CHECKPOINT_BASE="${CHECKPOINT_BASE:-/vol/checkpoints/tir_sft_checkpoints/tir_sft_project}"
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-/vol/checkpoints/tir_sft_checkpoints/tir_sft_project_v2}"
 EVAL_DATASET="${EVAL_DATASET:-asingh15/countdown_tasks_3to4}"
 OUTPUT_DIR="${OUTPUT_DIR:-/vol/evaluation/eval_results}"
 
@@ -33,13 +33,20 @@ fi
 for run in "${RUNS[@]}"; do
     model_path="${CHECKPOINT_BASE}/${run}/model"
 
+    # Determine active tools based on run name
+    tools_flag=""
+    if [[ "$run" == calc_only_* ]]; then
+        tools_flag="--active_tools calculator"
+    fi
+
     echo "=== Launching ${run} WITH tools ==="
     MODAL_APP_NAME="eval-${run}-tools" \
     modal run --detach "$PROJECT_ROOT/modal_train.py" eval_tir -- \
         --model_path "$model_path" \
         --eval_dataset "$EVAL_DATASET" \
         --output_dir "$OUTPUT_DIR" \
-        --output_name "${run}_with_tools" &
+        --output_name "${run}_with_tools" \
+        $tools_flag &
 
     echo "=== Launching ${run} WITHOUT tools ==="
     MODAL_APP_NAME="eval-${run}-no-tools" \

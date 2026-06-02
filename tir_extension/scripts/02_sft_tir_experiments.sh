@@ -29,7 +29,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-2}"
 LR="${LR:-1e-5}"
 EPOCHS="${EPOCHS:-10}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
-WANDB_PROJECT="${WANDB_PROJECT:-tir_sft_project}"
+WANDB_PROJECT="${WANDB_PROJECT:-tir_sft_project_v2}"
 HF_USER="${HF_USER:-sbfisher}"
 
 # Paths to trajectory datasets on Modal volume
@@ -46,10 +46,17 @@ run_one() {
     local run_name="$1"
     local model_name="$2"
     local trajectory_path="$3"
+    local active_tools="${4:-}"  # optional: comma-separated tool names for I^T
     local hf_repo="${HF_USER}/tir-sft-${run_name}"
 
     echo "=== ${run_name}: model=${model_name}, data=$(basename ${trajectory_path}) ==="
 
+    local tools_flag=""
+    if [[ -n "$active_tools" ]]; then
+        tools_flag="--active_tools $active_tools"
+    fi
+
+    MODAL_APP_NAME="sft-${run_name}" \
     modal run --detach "$PROJECT_ROOT/modal_train.py" tir_sft -- \
         --model_name "$model_name" \
         --trajectory_path "$trajectory_path" \
@@ -63,7 +70,8 @@ run_one() {
         --gradient_checkpointing 1 \
         --wandb_project "$WANDB_PROJECT" \
         --wandb_name "$run_name" \
-        --hf_repo "$hf_repo"
+        --hf_repo "$hf_repo" \
+        $tools_flag &
 
     echo "=== ${run_name} launched ==="
     echo ""
@@ -72,15 +80,17 @@ run_one() {
 case "$EXPERIMENT" in
     3tool_from_sft)      run_one "3tool_from_sft"      "$MODEL_SFT"  "$TRAJ_3TOOL" ;;
     3tool_from_base)     run_one "3tool_from_base"      "$MODEL_BASE" "$TRAJ_3TOOL" ;;
-    calc_only_from_sft)  run_one "calc_only_from_sft"   "$MODEL_SFT"  "$TRAJ_CALC_ONLY" ;;
-    calc_only_from_base) run_one "calc_only_from_base"  "$MODEL_BASE" "$TRAJ_CALC_ONLY" ;;
+    calc_only_from_sft)  run_one "calc_only_from_sft"   "$MODEL_SFT"  "$TRAJ_CALC_ONLY" "calculator" ;;
+    calc_only_from_base) run_one "calc_only_from_base"  "$MODEL_BASE" "$TRAJ_CALC_ONLY" "calculator" ;;
     all)
         run_one "3tool_from_sft"      "$MODEL_SFT"  "$TRAJ_3TOOL"
         run_one "3tool_from_base"     "$MODEL_BASE" "$TRAJ_3TOOL"
-        run_one "calc_only_from_sft"  "$MODEL_SFT"  "$TRAJ_CALC_ONLY"
-        run_one "calc_only_from_base" "$MODEL_BASE" "$TRAJ_CALC_ONLY"
+        run_one "calc_only_from_sft"  "$MODEL_SFT"  "$TRAJ_CALC_ONLY" "calculator"
+        run_one "calc_only_from_base" "$MODEL_BASE" "$TRAJ_CALC_ONLY" "calculator"
         ;;
     *) echo "Usage: $0 [3tool_from_sft|3tool_from_base|calc_only_from_sft|calc_only_from_base|all]"; exit 1 ;;
 esac
 
+wait
+echo "All SFT runs submitted to Modal."
 echo "Monitor runs at https://modal.com"

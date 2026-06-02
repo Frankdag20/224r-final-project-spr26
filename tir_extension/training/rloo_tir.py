@@ -48,6 +48,22 @@ from tir_extension.training.failure_aware_reward import (
     compute_score_with_tools,
 )
 from tir_extension.training.tir_sampling_worker import TIRSamplingWorker
+from tir_extension.tools.system_prompt import build_tool_system_prompt
+
+
+def _inject_tool_system_prompt(prompt: str, tool_system_prompt: str) -> str:
+    """Replace the default system message in a chat-templated prompt with I^T.
+
+    The dataset prompts have ``<|im_start|>system\\nYou are a helpful assistant.<|im_end|>``
+    baked in. We replace that with our tool-integrated instruction so the model
+    knows what tools are available during RLOO rollouts.
+    """
+    old_system = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
+    new_system = f"<|im_start|>system\n{tool_system_prompt}<|im_end|>"
+    if old_system in prompt:
+        return prompt.replace(old_system, new_system, 1)
+    # If the prompt doesn't have the expected system tag, prepend it.
+    return new_system + "\n" + prompt
 
 
 class TIRRLOOTrainer(RLOOTrainer):
@@ -87,6 +103,7 @@ class TIRRLOOTrainer(RLOOTrainer):
         self.save_failure_db_every_n_steps = save_failure_db_every_n_steps
         self.multi_turn_tools = multi_turn_tools
         self.max_tool_turns = max_tool_turns
+        self._tool_system_prompt: str | None = None  # built after active tools are set
 
         # Bounded persistent log of failed rollouts (seeded if a baseline run
         # already wrote one to the same path).
@@ -114,6 +131,12 @@ class TIRRLOOTrainer(RLOOTrainer):
             initial_tools=initial_tools,
             candidate_tools=set(TOOL_REGISTRY),
         )
+
+        # Build the tool-integrated system prompt (I^T) for RLOO rollouts.
+        self._tool_system_prompt = build_tool_system_prompt(
+            active_tools=self.tool_selector.active_tools
+        )
+        print(f"[TIR] Tool system prompt (I^T):\n{self._tool_system_prompt}\n")
 
         # Build the analyzer lazily so that runs without DSPy installed can
         # still construct the trainer (they will fail only when reanalyse is
@@ -311,15 +334,20 @@ class TIRRLOOTrainer(RLOOTrainer):
                 )
                 self._create_sampling_worker(model_path)
 
-                all_prompts = batch["prompt"]
+                all_prompts_raw = batch["prompt"]
                 all_ground_truth = batch["ground_truth"]
                 assert (
-                    len(all_prompts) == len(all_ground_truth) == self.batch_size
+                    len(all_prompts_raw) == len(all_ground_truth) == self.batch_size
                 ), (
-                    f"len(all_prompts) = {len(all_prompts)}, "
+                    f"len(all_prompts) = {len(all_prompts_raw)}, "
                     f"len(all_ground_truth) = {len(all_ground_truth)}, "
                     f"self.batch_size = {self.batch_size}"
                 )
+                # Inject tool-integrated instruction (I^T) into prompts.
+                all_prompts = [
+                    _inject_tool_system_prompt(p, self._tool_system_prompt)
+                    for p in all_prompts_raw
+                ]
                 all_raw_responses, all_sample_log_probs = ray.get(
                     self.sampling_worker.generate.remote(all_prompts)
                 )

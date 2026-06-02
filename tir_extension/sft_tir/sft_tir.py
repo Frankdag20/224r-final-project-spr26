@@ -33,6 +33,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from tir_extension.sft_tir.sft_tir_dataset import get_dataloaders
+from tir_extension.tools.system_prompt import build_tool_system_prompt
 
 
 def get_model(model_name: str, device: str = "cuda", use_gradient_checkpointing: bool = True):
@@ -226,6 +227,9 @@ def main():
                         default=True)
     parser.add_argument("--hf_repo", type=str, default="",
                         help="If set, push final checkpoint to this HuggingFace repo (e.g. 'username/model-name').")
+    parser.add_argument("--active_tools", type=str, default=None,
+                        help="Comma-separated tool names for I^T system prompt. "
+                             "Default: all relevant tools. Use 'calculator' for calc-only.")
     args = parser.parse_args()
 
     wandb.init(project=args.wandb_project, name=args.wandb_name)
@@ -237,6 +241,10 @@ def main():
         use_gradient_checkpointing=bool(args.gradient_checkpointing),
     )
 
+    active_tools = args.active_tools.split(",") if args.active_tools else None
+    tool_system_prompt = build_tool_system_prompt(active_tools=active_tools)
+    print(f"Tool system prompt (I^T):\n{tool_system_prompt}\n")
+
     dataloaders = get_dataloaders(
         json_path=args.trajectory_path,
         tokenizer=tokenizer,
@@ -246,6 +254,7 @@ def main():
         keep_only_full_score=args.keep_only_full_score,
         val_fraction=args.val_fraction,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        system_prompt=tool_system_prompt,
     )
     train_dataloader = dataloaders["train"]
     test_dataloader = dataloaders.get("test")
