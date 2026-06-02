@@ -73,6 +73,10 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
         self_critic_n_queries: int = 4,
         multi_tool_bonus: float = 0.1,
         min_tools_for_bonus: int = 2,
+        # Curriculum: start easy (1 tool), tighten to min_tools_for_bonus
+        # once this fraction of num_training_steps is reached. Set to 0.0
+        # to disable curriculum (use min_tools_for_bonus from the start).
+        curriculum_phase2_frac: float = 0.5,
         **tir_kwargs,
     ):
         # Disable the old tool_reward / tool_penalty shaping from TIRRLOOTrainer
@@ -86,6 +90,7 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
         self.self_critic_n_queries = self_critic_n_queries
         self.multi_tool_bonus = multi_tool_bonus
         self.min_tools_for_bonus = min_tools_for_bonus
+        self.curriculum_phase2_frac = curriculum_phase2_frac
 
         self.wandb.config.update(
             {
@@ -94,8 +99,30 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
                 "sc_n_queries": self_critic_n_queries,
                 "sc_multi_tool_bonus": multi_tool_bonus,
                 "sc_min_tools_for_bonus": min_tools_for_bonus,
+                "sc_curriculum_phase2_frac": curriculum_phase2_frac,
             }
         )
+
+    # ------------------------------------------------------------------
+    # Curriculum: gradually tighten the multi-tool bonus threshold.
+    # ------------------------------------------------------------------
+
+    def _current_min_tools(self, global_step: int) -> int:
+        """Return the active min_tools_for_bonus for this step.
+
+        Phase 1 (steps 0 .. phase2_start-1): require only 1 tool — easy
+            signal that encourages any tool use at all.
+        Phase 2 (steps phase2_start .. end): tighten to min_tools_for_bonus
+            (default 2) — reward collaborative multi-tool use.
+
+        Set curriculum_phase2_frac=0.0 to skip phase 1 entirely.
+        """
+        if self.curriculum_phase2_frac <= 0.0:
+            return self.min_tools_for_bonus
+        phase2_start = int(self.num_training_steps * self.curriculum_phase2_frac)
+        if global_step < phase2_start:
+            return 1
+        return self.min_tools_for_bonus
 
     # ------------------------------------------------------------------
     # Reward helper (replaces the clipped tool-aware reward).
@@ -106,8 +133,10 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
         all_responses: list[list[str]],
         all_ground_truth: list[dict],
         active_tools: set[str],
+        global_step: int = 0,
     ) -> tuple[list[list[float]], list[dict]]:
         """Score all response groups with the hierarchical reward."""
+        min_tools = self._current_min_tools(global_step)
         all_rewards: list[list[float]] = []
         all_meta: list[dict] = []
         for resp_group, gt in zip(all_responses, all_ground_truth):
@@ -118,7 +147,7 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
                     ground_truth=gt,
                     active_tools=active_tools,
                     multi_tool_bonus=self.multi_tool_bonus,
-                    min_tools_for_bonus=self.min_tools_for_bonus,
+                    min_tools_for_bonus=min_tools,
                 )
                 group_rewards.append(reward)
                 all_meta.append(meta)
@@ -151,23 +180,31 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
 
         # --- sample self_critic_n_samples responses per query ---
         self._create_sampling_worker(model_path)
-        sc_raw_responses, sc_sample_lp = ray.get(
-            self.sampling_worker.generate.remote(
-                sc_prompts, n=self.self_critic_n_samples
+        if self.multi_turn:
+            sc_responses, sc_sample_lp = ray.get(
+                self.sampling_worker.generate_multi_turn.remote(
+                    sc_prompts,
+                    active_tools=list(active_tools),
+                    max_tool_calls=self.max_tool_call_truncation,
+                    n=self.self_critic_n_samples,
+                )
             )
-        )
-
-        # --- execute tools ---
-        sc_responses: list[list[str]] = [
-            [
-                execute_tool_calls(r, active_tools=active_tools, max_calls=self.max_tool_call_truncation)
-                for r in group
+        else:
+            sc_raw_responses, sc_sample_lp = ray.get(
+                self.sampling_worker.generate.remote(
+                    sc_prompts, n=self.self_critic_n_samples
+                )
+            )
+            sc_responses = [
+                [execute_tool_calls(r, active_tools=active_tools,
+                                    max_calls=self.max_tool_call_truncation)
+                 for r in group]
+                for group in sc_raw_responses
             ]
-            for group in sc_raw_responses
-        ]
 
         # --- hierarchical reward ---
-        sc_rewards, sc_meta = self._score_responses(sc_responses, sc_gt, active_tools)
+        sc_rewards, sc_meta = self._score_responses(sc_responses, sc_gt, active_tools,
+                                                     global_step=global_step)
 
         n_pos = sum(1 for g in sc_rewards for r in g if r >= 1.0)
         n_neg = sum(1 for g in sc_rewards for r in g if r < 1.0)
@@ -275,16 +312,26 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
                 )
 
                 active_tools = set(self.tool_selector.active_tools)
-                all_responses: list[list[str]] = [
-                    [
-                        execute_tool_calls(r, active_tools=active_tools, max_calls=self.max_tool_call_truncation)
-                        for r in group
+                if self.multi_turn:
+                    all_responses, all_sample_lp = ray.get(
+                        self.sampling_worker.generate_multi_turn.remote(
+                            all_prompts,
+                            active_tools=list(active_tools),
+                            max_tool_calls=self.max_tool_call_truncation,
+                        )
+                    )
+                    all_sample_log_probs = all_sample_lp
+                else:
+                    all_responses = [
+                        [execute_tool_calls(r, active_tools=active_tools,
+                                            max_calls=self.max_tool_call_truncation)
+                         for r in group]
+                        for group in all_raw_responses
                     ]
-                    for group in all_raw_responses
-                ]
 
                 all_rewards, all_meta = self._score_responses(
-                    all_responses, all_ground_truth, active_tools
+                    all_responses, all_ground_truth, active_tools,
+                    global_step=global_step,
                 )
 
                 reward_mean = float(np.mean(all_rewards))
@@ -395,6 +442,8 @@ class SelfCriticTIRTrainer(TIRRLOOTrainer):
                     "tir/failure_db_size": len(self.failure_db),
                     "tir/n_active_tools": len(self.tool_selector.active_tools),
                     "tir/active_tools": ",".join(sorted(self.tool_selector.active_tools)),
+                    "curriculum/min_tools_for_bonus": self._current_min_tools(global_step),
+                    "curriculum/phase": 1 if self._current_min_tools(global_step) == 1 else 2,
                     **{f"train/{k}": v for k, v in all_metrics.items()},
                     **hier_metrics,
                     **{f"tir/failure_type_{name}": count for name, count in failure_counts.items()},
@@ -480,7 +529,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--group_size", type=int, default=2)
     parser.add_argument("--entropy_coefficient", type=float, default=0.01)
-    parser.add_argument("--kl_divergence_coefficient", type=float, default=0.0)
+    parser.add_argument("--kl_divergence_coefficient", type=float, default=0.01)
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--num_training_steps", type=int, default=300)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -522,6 +571,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="rM bonus for using >= min_tools_for_bonus tools.")
     parser.add_argument("--min_tools_for_bonus", type=int, default=2,
                         help="Distinct relevant tools needed to earn rM.")
+    parser.add_argument("--curriculum_phase2_frac", type=float, default=0.5,
+                        help="Fraction of total steps before tightening tool bonus threshold. 0=disable.")
+    parser.add_argument("--multi_turn", type=int, default=1,
+                        help="1=multi-turn tool use (model sees real results), 0=single-turn legacy.")
     return parser
 
 
@@ -554,6 +607,8 @@ def main():
         "self_critic_n_queries": args.self_critic_n_queries,
         "multi_tool_bonus": args.multi_tool_bonus,
         "min_tools_for_bonus": args.min_tools_for_bonus,
+        "curriculum_phase2_frac": args.curriculum_phase2_frac,
+        "multi_turn": bool(args.multi_turn),
     }
     rloo_kwargs = dict(
         model_name=args.model_name,

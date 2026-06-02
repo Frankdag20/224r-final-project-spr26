@@ -73,7 +73,17 @@ class IPODataset(Dataset):
         self.num_proc = num_proc
         self.split = split
 
-        self.dataset = load_dataset(dataset_name, num_proc=self.num_proc, split=split)
+        if dataset_name.endswith(".json") and os.path.exists(dataset_name):
+            import json as _json
+            from datasets import Dataset as _HFDataset
+            with open(dataset_name) as _f:
+                _records = _json.load(_f)
+            # Support {"train": [...], "test": [...]} or flat list.
+            if isinstance(_records, dict):
+                _records = _records.get(split, _records.get("train", []))
+            self.dataset = _HFDataset.from_list(_records)
+        else:
+            self.dataset = load_dataset(dataset_name, num_proc=self.num_proc, split=split)
         curr_map_fn = get_map_fn(self.tokenizer, self.prompt_key, self.response_w_key, self.response_l_key)
         self.dataset = self.dataset.map(curr_map_fn, num_proc=self.num_proc, desc="Applying chat template")
 

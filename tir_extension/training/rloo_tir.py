@@ -67,6 +67,7 @@ class TIRRLOOTrainer(RLOOTrainer):
         initial_active_tools: str | None = None,
         max_tool_call_truncation: int = 16,
         save_failure_db_every_n_steps: int = 5,
+        multi_turn: bool = True,
         # Everything else is forwarded straight to RLOOTrainer.
         **rloo_kwargs,
     ):
@@ -82,6 +83,7 @@ class TIRRLOOTrainer(RLOOTrainer):
         self.dspy_max_tokens = dspy_max_tokens
         self.max_tool_call_truncation = max_tool_call_truncation
         self.save_failure_db_every_n_steps = save_failure_db_every_n_steps
+        self.multi_turn = multi_turn
 
         # Bounded persistent log of failed rollouts (seeded if a baseline run
         # already wrote one to the same path).
@@ -282,23 +284,28 @@ class TIRRLOOTrainer(RLOOTrainer):
                     f"len(all_ground_truth) = {len(all_ground_truth)}, "
                     f"self.batch_size = {self.batch_size}"
                 )
-                all_raw_responses, all_sample_log_probs = ray.get(
-                    self.sampling_worker.generate.remote(all_prompts)
-                )
-
-                # ----- 2) Tool execution -----
                 active_tools = set(self.tool_selector.active_tools)
-                all_responses: list[list[str]] = []
-                for raw_group in all_raw_responses:
-                    materialised = [
-                        execute_tool_calls(
-                            response,
-                            active_tools=active_tools,
-                            max_calls=self.max_tool_call_truncation,
+
+                if self.multi_turn:
+                    # True multi-turn: model sees real tool results mid-generation.
+                    all_responses, all_sample_log_probs = ray.get(
+                        self.sampling_worker.generate_multi_turn.remote(
+                            all_prompts,
+                            active_tools=list(active_tools),
+                            max_tool_calls=self.max_tool_call_truncation,
                         )
-                        for response in raw_group
+                    )
+                else:
+                    # Legacy single-turn: execute tools post-hoc.
+                    all_raw_responses, all_sample_log_probs = ray.get(
+                        self.sampling_worker.generate.remote(all_prompts)
+                    )
+                    all_responses = [
+                        [execute_tool_calls(r, active_tools=active_tools,
+                                            max_calls=self.max_tool_call_truncation)
+                         for r in group]
+                        for group in all_raw_responses
                     ]
-                    all_responses.append(materialised)
 
                 # ----- 3) Tool-aware rewards -----
                 all_rewards: list[list[float]] = []
@@ -550,6 +557,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated subset of tool names. Defaults to all relevant.")
     parser.add_argument("--max_tool_call_truncation", type=int, default=16)
     parser.add_argument("--save_failure_db_every_n_steps", type=int, default=5)
+    parser.add_argument("--multi_turn", type=int, default=1,
+                        help="1=multi-turn tool use (model sees real results), 0=single-turn legacy.")
     return parser
 
 
@@ -579,6 +588,7 @@ def main():
         "initial_active_tools": args.initial_active_tools,
         "max_tool_call_truncation": args.max_tool_call_truncation,
         "save_failure_db_every_n_steps": args.save_failure_db_every_n_steps,
+        "multi_turn": bool(args.multi_turn),
     }
     rloo_kwargs = dict(
         model_name=args.model_name,

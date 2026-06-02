@@ -54,6 +54,8 @@ class SamplingWorker:
             and 0 < tokenizer_max_length < 1_000_000
         ):
             effective_max_model_len = min(effective_max_model_len, tokenizer_max_length)
+            
+        self.effective_max_model_len = effective_max_model_len
         effective_max_num_batched_tokens = self.max_num_batched_tokens
         if (
             effective_max_model_len is not None
@@ -150,6 +152,96 @@ class SamplingWorker:
                 seq_logprob += float(token_entry)
 
         return float(seq_logprob)
+
+    def generate_multi_turn(
+        self,
+        prompts: list[str],
+        active_tools: list[str] | None = None,
+        max_tool_calls: int = 8,
+        n: int | None = None,
+    ) -> tuple[list[list[str]], list[list[float]]]:
+        """Multi-turn generation: stop on </use_tool>, execute the tool,
+        feed the real result back, then continue — the model actually SEES
+        tool outputs instead of hallucinating them.
+
+        Returns the same (responses, logprobs) shape as generate().
+        """
+        from vllm import SamplingParams as _SP
+        from tir_extension.tools.tool_pool import TOOL_REGISTRY, get_tool, parse_tool_calls
+
+        group = n or self.group_size
+        n_prompts = len(prompts)
+        active_set = set(active_tools) if active_tools is not None else set(TOOL_REGISTRY)
+
+        # Per-(prompt, response) state.
+        contexts = [[prompts[p] for _ in range(group)] for p in range(n_prompts)]
+        responses = [[""] * group for _ in range(n_prompts)]
+        logprobs = [[0.0] * group for _ in range(n_prompts)]
+        done = [[False] * group for _ in range(n_prompts)]
+
+        for turn in range(max_tool_calls + 1):
+            pending = [(p, r) for p in range(n_prompts) for r in range(group) if not done[p][r]]
+            if not pending:
+                break
+
+            # On the final turn, only stop on </answer> (no more tool calls).
+            stop_tokens = ["</answer>", "</use_tool>"] if turn < max_tool_calls else ["</answer>"]
+            sp = _SP(
+                temperature=self.temperature, top_p=self.top_p,
+                top_k=self.top_k, min_p=self.min_p,
+                max_tokens=self.max_tokens, n=1,
+                stop=stop_tokens, include_stop_str_in_output=True,
+                logprobs=1,
+            )
+
+            # Filter out contexts that exceed max_model_len using the tokenizer.
+            # Use getattr to safely pull the effective length
+            current_max = getattr(self, "effective_max_model_len", self.max_model_len) 
+            max_ctx_len = (current_max or 2048) - 256
+            safe_pending = []
+            safe_ctxs = []
+            for p, r in pending:
+                ctx = contexts[p][r]
+                tok_len = len(self.tokenizer.encode(ctx, add_special_tokens=False))
+                if tok_len < max_ctx_len:
+                    safe_pending.append((p, r))
+                    safe_ctxs.append(ctx)
+                else:
+                    done[p][r] = True  # context too long, stop here
+
+            if not safe_ctxs:
+                break
+
+            outputs = self.llm.generate(safe_ctxs, sp)
+            pending = safe_pending
+
+            for (p, r), out in zip(pending, outputs):
+                o = out.outputs[0]
+                generated = o.text
+                responses[p][r] += generated
+                logprobs[p][r] += self._extract_sequence_logprob(o)
+
+                if "</use_tool>" in generated and turn < max_tool_calls:
+                    # Execute the last tool call in the generated text.
+                    calls = parse_tool_calls(generated)
+                    if calls:
+                        name, inp = calls[-1]
+                        if name in TOOL_REGISTRY and name in active_set:
+                            try:
+                                result = get_tool(name)(inp)
+                            except Exception as exc:
+                                result = f"error: {exc}"
+                        else:
+                            result = f"error: tool '{name}' not available"
+                        tool_block = f"<tool_result>{result}</tool_result>"
+                        responses[p][r] += tool_block
+                        contexts[p][r] += generated + tool_block
+                    else:
+                        done[p][r] = True
+                else:
+                    done[p][r] = True
+
+        return responses, logprobs
 
     def generate(
         self,

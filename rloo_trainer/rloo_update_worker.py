@@ -273,8 +273,13 @@ class RLOOUpdateWorker:
         group_sum = rewards_g.sum(dim=1, keepdim=True)
         baseline = (group_sum - rewards_g) / (group - 1)
 
-        # Compute advantage
-        adv = (rewards_g - baseline).view(-1)
+        # Compute advantage and normalize by per-group std (GRPO-style).
+        # This keeps gradient magnitude invariant to reward scale, preventing
+        # large updates from rewards like -1 and ensuring a non-zero signal
+        # even when absolute reward values are similar across steps.
+        adv_raw = rewards_g - baseline
+        group_std = rewards_g.std(dim=1, keepdim=True).clamp(min=1e-8)
+        adv = (adv_raw / group_std).view(-1)
 
         log_probs_filt = (token_log_probs * shifted_mask).sum(dim=-1)
 
