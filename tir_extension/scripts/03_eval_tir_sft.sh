@@ -1,36 +1,56 @@
 #!/bin/bash
-# Evaluate the TIR SFT checkpoint with multi-turn tool execution.
+# Evaluate TIR SFT checkpoints — runs both with-tools and no-tools evals.
 #
-# Run this after Stage 2 to verify the SFT model can use tools
-# and solve Countdown problems (target: comparable to baseline ~31.5% pass@1).
+# Usage:
+#   source .env && bash tir_extension/scripts/03_eval_tir_sft.sh                    # eval all runs
+#   source .env && bash tir_extension/scripts/03_eval_tir_sft.sh 3tool_from_sft     # eval one specific run
+#
+# Prerequisites:
+#   source .env  (needs HF_TOKEN, WANDB_API_KEY)
 
 set -euo pipefail
 
-export WANDB__SERVICE_WAIT="${WANDB__SERVICE_WAIT:-300}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Point this at the SFT checkpoint model directory
-MODEL_PATH="${MODEL_PATH:-/vol/checkpoints/tir_sft_checkpoints/tir_sft_project/tir_sft_lr5e-5_ep6/model}"
-OUTPUT_NAME="${OUTPUT_NAME:-tir_sft_eval}"
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-/vol/checkpoints/tir_sft_checkpoints/tir_sft_project}"
+EVAL_DATASET="${EVAL_DATASET:-asingh15/countdown_tasks_3to4}"
 OUTPUT_DIR="${OUTPUT_DIR:-/vol/evaluation/eval_results}"
 
-echo "=== Evaluating TIR SFT checkpoint ==="
-echo "Model: ${MODEL_PATH}"
+# All run names to evaluate (override with first arg for single run)
+ALL_RUNS=(
+    "3tool_from_sft"
+    "3tool_from_base"
+    "calc_only_from_sft"
+    "calc_only_from_base"
+)
 
-# With tools (multi-turn)
-modal run modal_train.py eval_tir -- \
-    --model_path "$MODEL_PATH" \
-    --output_dir "$OUTPUT_DIR" \
-    --output_name "${OUTPUT_NAME}_with_tools" \
-    --num_responses 16 \
-    --max_tool_turns 5
+if [[ $# -ge 1 ]]; then
+    RUNS=("$1")
+else
+    RUNS=("${ALL_RUNS[@]}")
+fi
 
-# Without tools (baseline comparison)
-modal run modal_train.py eval_tir -- \
-    --model_path "$MODEL_PATH" \
-    --output_dir "$OUTPUT_DIR" \
-    --output_name "${OUTPUT_NAME}_no_tools" \
-    --num_responses 16 \
-    --no_tools
+for run in "${RUNS[@]}"; do
+    model_path="${CHECKPOINT_BASE}/${run}/model"
 
-echo "=== Done. Results at ${OUTPUT_DIR}/ ==="
-echo "Download with: modal volume get default-proj-training evaluation/eval_results ./eval_results"
+    echo "=== Evaluating ${run} WITH tools ==="
+    modal run --detach "$PROJECT_ROOT/modal_train.py" eval_tir -- \
+        --model_path "$model_path" \
+        --eval_dataset "$EVAL_DATASET" \
+        --output_dir "$OUTPUT_DIR" \
+        --output_name "${run}_with_tools"
+
+    echo "=== Evaluating ${run} WITHOUT tools ==="
+    modal run --detach "$PROJECT_ROOT/modal_train.py" eval_tir -- \
+        --model_path "$model_path" \
+        --eval_dataset "$EVAL_DATASET" \
+        --output_dir "$OUTPUT_DIR" \
+        --output_name "${run}_no_tools" \
+        --no_tools
+done
+
+echo ""
+echo "All evals launched. Monitor at https://modal.com"
+echo "Once complete, download results with:"
+echo "  modal volume get default-proj-training evaluation/eval_results/ ./eval_results/"

@@ -224,6 +224,8 @@ def main():
     parser.add_argument("--gradient_clipping", type=float, default=1.0)
     parser.add_argument("--keep_only_full_score", type=lambda x: x.lower() == "true",
                         default=True)
+    parser.add_argument("--hf_repo", type=str, default="",
+                        help="If set, push final checkpoint to this HuggingFace repo (e.g. 'username/model-name').")
     args = parser.parse_args()
 
     wandb.init(project=args.wandb_project, name=args.wandb_name)
@@ -281,6 +283,16 @@ def main():
         args.gradient_accumulation_steps,
         args.gradient_clipping,
     )
+
+    if args.hf_repo:
+        print(f"Pushing checkpoint to HuggingFace: {args.hf_repo}")
+        model_dir = os.path.join(full_output_dir, "model")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        hf_model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.bfloat16)
+        hf_tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        hf_model.push_to_hub(args.hf_repo)
+        hf_tokenizer.push_to_hub(args.hf_repo)
+        print(f"Pushed to https://huggingface.co/{args.hf_repo}")
 
 
 if __name__ == "__main__":

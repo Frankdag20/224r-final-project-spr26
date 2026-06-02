@@ -285,13 +285,43 @@ def _run_eval_script(script_path: str, eval_args: list[str]) -> str:
     return "Finished TIR evaluation run and persisted results to the Modal volume."
 
 
+@app.function(
+    image=base_image,
+    gpu=GPU_CONFIG,
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
+def push_to_hf(args: list[str]) -> str:
+    import argparse as _ap
+    p = _ap.ArgumentParser()
+    p.add_argument("--model_path", required=True, help="Path on Modal volume, e.g. /vol/checkpoints/...")
+    p.add_argument("--hf_repo", required=True, help="HF repo, e.g. sbfisher/tir-sft-3tool-from-sft")
+    parsed = p.parse_args(args)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+
+    model_dir = os.path.join(parsed.model_path, "model") if not parsed.model_path.endswith("/model") else parsed.model_path
+    print(f"Loading model from {model_dir}")
+    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    print(f"Pushing to https://huggingface.co/{parsed.hf_repo}")
+    model.push_to_hub(parsed.hf_repo)
+    tokenizer.push_to_hub(parsed.hf_repo)
+    print("Done!")
+    return f"Pushed {model_dir} to https://huggingface.co/{parsed.hf_repo}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Launch one of the existing training entrypoints on Modal.",
     )
     parser.add_argument(
         "trainer",
-        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo", "eval_tir"),
+        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo", "eval_tir", "push_hf"),
     )
     parser.add_argument(
         "trainer_args",
@@ -324,6 +354,8 @@ def main(*raw_args: str) -> None:
         result = run_tir_rloo.remote(trainer_args)
     elif args.trainer == "eval_tir":
         result = run_eval_tir.remote(trainer_args)
+    elif args.trainer == "push_hf":
+        result = push_to_hf.remote(trainer_args)
     else:
         result = run_rloo.remote(trainer_args)
 
