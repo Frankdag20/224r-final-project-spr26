@@ -65,7 +65,12 @@
 - **HF repo**: `sbfisher/tir-sft-3tool-from-base` (auto-push on completion)
 - **Checkpoint**: `/vol/checkpoints/tir_sft_checkpoints/tir_sft_project/3tool_from_base/model/` (Modal volume)
 - **Rationale**: Cold-start ablation. Does the model need prior Countdown SFT, or can it learn task + tool use together?
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: `eval_results/3tool_from_base_with_tools.json`
+  - pass@1 = 44.0%, pass@4 = 66.0%, pass@8 = 70.0%, pass@16 = 70.0%
+- **Eval results (no tools)**: `eval_results/3tool_from_base_no_tools.json`
+  - pass@1 = 38.0%, pass@4 = 66.0%, pass@8 = 70.0%, pass@16 = 72.0%
+- **Key finding**: Cold start hurts significantly vs warm start (44% vs 62% pass@1 with tools). Tool boost smaller (+6pp vs +28pp).
 
 ## Run 6: TIR SFT — calculator-only, from vanilla SFT checkpoint
 - **Date**: 2026-06-01
@@ -76,8 +81,12 @@
 - **HF repo**: `sbfisher/tir-sft-calc-only-from-sft` (auto-push on completion)
 - **Checkpoint**: `/vol/checkpoints/tir_sft_checkpoints/tir_sft_project/calc_only_from_sft/model/` (Modal volume)
 - **Rationale**: Cleaner tool setup matching literature. Tests whether single useful tool (calculator) outperforms 3 tools (2 of which are busywork).
-- **Eval plan**: Evaluate BOTH with and without tools
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: `eval_results/calc_only_from_sft_with_tools.json`
+  - pass@1 = 56.0%, pass@4 = 72.0%, pass@8 = 74.0%, pass@16 = 78.0%
+- **Eval results (no tools)**: `eval_results/calc_only_from_sft_no_tools.json`
+  - pass@1 = 46.0%, pass@4 = 68.0%, pass@8 = 74.0%, pass@16 = 78.0%
+- **Key finding**: Calculator-only slightly below 3-tool with tools (56% vs 62% pass@1), but better without tools (46% vs 34%).
 
 ## Run 7: TIR SFT — calculator-only, from base Qwen (cold start)
 - **Date**: 2026-06-01
@@ -88,7 +97,33 @@
 - **HF repo**: `sbfisher/tir-sft-calc-only-from-base` (auto-push on completion)
 - **Checkpoint**: `/vol/checkpoints/tir_sft_checkpoints/tir_sft_project/calc_only_from_base/model/` (Modal volume)
 - **Rationale**: Cleanest experiment — cold start + single tool. Matches Tool-Star literature most closely.
-- **Status**: RUNNING (Modal, detached)
+- **Status**: COMPLETE
+- **Eval results (with tools)**: `eval_results/calc_only_from_base_with_tools.json`
+  - pass@1 = 52.0%, pass@4 = 62.0%, pass@8 = 66.0%, pass@16 = 68.0%
+- **Eval results (no tools)**: `eval_results/calc_only_from_base_no_tools.json`
+  - pass@1 = 38.0%, pass@4 = 62.0%, pass@8 = 66.0%, pass@16 = 68.0%
+- **Key finding**: Cold start + calc-only has decent tool boost (+14pp pass@1). Lowest ceiling (68% pass@16).
+
+---
+
+## TIR SFT Eval Summary (Runs 4-7)
+
+| Run | Base Model | Tools | pass@1 | pass@4 | pass@8 | pass@16 |
+|-----|-----------|-------|--------|--------|--------|---------|
+| 3tool_from_sft | Vanilla SFT | Yes | **62%** | 72% | 76% | 78% |
+| 3tool_from_sft | Vanilla SFT | No | 34% | 64% | 76% | 78% |
+| calc_only_from_sft | Vanilla SFT | Yes | 56% | 72% | 74% | 78% |
+| calc_only_from_sft | Vanilla SFT | No | 46% | 68% | 74% | 78% |
+| 3tool_from_base | Base Qwen | Yes | 44% | 66% | 70% | 70% |
+| 3tool_from_base | Base Qwen | No | 38% | 66% | 70% | 72% |
+| calc_only_from_base | Base Qwen | Yes | 52% | 62% | 66% | 68% |
+| calc_only_from_base | Base Qwen | No | 38% | 62% | 66% | 68% |
+
+**Key takeaways:**
+1. **Warm start (vanilla SFT) >> cold start (base Qwen)** across the board. Prior task knowledge matters.
+2. **Tool execution boosts pass@1 significantly** — biggest gain with 3-tool warm start (+28pp), smallest with 3-tool cold start (+6pp).
+3. **3-tool vs calc-only**: 3-tool wins with tools (62% vs 56%), but calc-only is better without tools (46% vs 34%), suggesting extra tools may hurt when model must hallucinate results.
+4. **Best overall: 3tool_from_sft with tools (62% pass@1, 78% pass@16)** — best candidate for RLOO.
 
 ---
 

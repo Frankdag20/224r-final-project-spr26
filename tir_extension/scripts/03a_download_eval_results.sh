@@ -13,7 +13,13 @@ EVAL_DIR="$PROJECT_ROOT/eval_results"
 mkdir -p "$EVAL_DIR"
 
 echo "Downloading eval results from Modal volume..."
-modal volume get default-proj-training evaluation/eval_results/ "$EVAL_DIR/"
+modal volume get default-proj-training evaluation/eval_results/ "$EVAL_DIR/" --force
+
+# Flatten nested eval_results/ if modal creates one
+if [ -d "$EVAL_DIR/eval_results" ]; then
+    cp "$EVAL_DIR/eval_results/"*.json "$EVAL_DIR/" 2>/dev/null || true
+    rm -rf "$EVAL_DIR/eval_results"
+fi
 
 echo ""
 echo "Computing pass@k for all eval results:"
