@@ -289,10 +289,15 @@ class RLOOUpdateWorker:
                 sample_log_probs_torch = torch.from_numpy(sample_log_probs).to(device)
                 ratio = torch.exp(torch.clamp(log_probs_filt - sample_log_probs_torch, -20, 20))
                 weights = torch.clamp(ratio, max=100)
+                raw_weight_mean = weights.mean().item()
+                # Self-normalize: E[w] should be 1 by IS identity; systematic deviation
+                # means vLLM/HF numerical mismatch, not true distribution shift.
+                weights = weights / weights.mean().clamp(min=1e-8)
 
             policy_loss = -(weights * log_probs_filt * adv.detach()).mean()
         else:
             weights = torch.ones_like(log_probs_filt)
+            raw_weight_mean = 1.0
             policy_loss = -(log_probs_filt * adv.detach()).mean()
         
         # Add entropy regularization
@@ -340,7 +345,7 @@ class RLOOUpdateWorker:
             'entropy_loss': ent_loss.item(),
             'kl_loss': kl_loss.item(),
             'total_loss': loss.item(),
-            'weight_mean': weights.mean().item(),
+            'weight_mean': raw_weight_mean,
             'tool_result_mask_fraction': tool_result_fraction,
         }
 

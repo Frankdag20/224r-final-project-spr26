@@ -3,13 +3,24 @@
 The base Countdown reward returns 0.0 / 0.1 / 1.0. This wrapper adds:
 
 - A per-call bonus for invoking a **relevant** tool that's currently in
-  the active tool set (recommended by DSPy).
+  the active tool set (recommended by DSPy) AND whose result is non-error.
 - A per-call penalty for invoking an **irrelevant** tool, regardless of
   whether it's active.
 
 The final reward is clipped to [0, 1] so an excessive number of correct
 tool calls can't dominate the base correctness signal, but the policy
 still gets an early shaping signal even when ``base_score == 0``.
+
+Reward hacking guard
+--------------------
+``format_score`` defaults to **0.0** (binary reward) so that a wrong
+answer inside ``<answer>`` tags earns nothing. The previous default of 0.1
+created a stable exploit: the model could spam malformed tool calls and
+always get 0.1, leading to complete reward collapse.
+
+Tool bonuses are gated on the tool returning a **non-error result** (the
+``<tool_result>`` block does not start with ``error:``). This prevents
+the same exploit at the tool-reward level.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from tir_extension.tools.tool_pool import (
     TOOL_REGISTRY,
     irrelevant_tool_names,
     parse_tool_calls,
+    parse_tool_calls_with_results,
     relevant_tool_names,
 )
 
@@ -42,22 +54,26 @@ def compute_score_with_tools(
     max_bonus_calls: int = 3,
     clip_low: float = 0.0,
     clip_high: float = 1.0,
-    format_score: float = 0.1,
+    format_score: float = 0.0,
     score: float = 1.0,
 ) -> tuple[float, dict]:
     """Return ``(final_score, metadata)`` for a single rollout.
 
     Args:
-        response: Full model response (potentially with executed tool results).
+        response: Full model response (with executed tool results injected).
         ground_truth: ``{target, numbers}`` dict, same format as compute_score.
         active_tools: Tool names currently enabled (typically the DSPy
             recommendation). ``None`` falls back to the relevant tool set.
-        tool_reward: Bonus per *relevant + active* tool invocation.
+        tool_reward: Bonus per *relevant + active* tool invocation with a
+            non-error result.
         tool_penalty: Penalty per *irrelevant* tool invocation.
         max_bonus_calls: Cap on how many relevant calls earn a bonus (so the
             policy can't farm reward by spamming calls).
         clip_low, clip_high: Final clipping range.
-        format_score, score: Base Countdown reward levels (passed through).
+        format_score: Score for a syntactically-valid but wrong answer.
+            Defaults to 0.0 (binary reward) to eliminate the reward-hacking
+            exploit of spamming any expression in <answer> tags.
+        score: Score for a fully correct answer.
     """
     base_score = compute_score(
         response,
@@ -73,21 +89,26 @@ def compute_score_with_tools(
     relevant_set = relevant_tool_names()
     irrelevant_set = irrelevant_tool_names()
 
-    tool_calls = parse_tool_calls(response)
+    # Use results-aware parsing so we only credit tool calls that actually
+    # succeeded (result block present and does not start with "error:").
+    tool_calls_with_results = parse_tool_calls_with_results(response)
+    # Fall back to result-less parsing for calls with no <tool_result> block.
+    all_tool_calls = parse_tool_calls(response)
 
     relevant_invoked: list[str] = []
     irrelevant_invoked: list[str] = []
     unknown_invoked: list[str] = []
-    for name, _input in tool_calls:
+
+    for name, _args, result in tool_calls_with_results:
         if name not in TOOL_REGISTRY:
             unknown_invoked.append(name)
             continue
+        result_valid = result is not None and not result.strip().startswith("error:")
         if name in relevant_set and name in active_set:
-            relevant_invoked.append(name)
+            if result_valid:
+                relevant_invoked.append(name)
         elif name in irrelevant_set:
             irrelevant_invoked.append(name)
-        # Relevant-but-inactive tools are neither rewarded nor penalised;
-        # we treat them as "neutral" so the policy can still explore.
 
     bonus_calls = min(len(relevant_invoked), max_bonus_calls)
     bonus = tool_reward * bonus_calls
@@ -101,11 +122,11 @@ def compute_score_with_tools(
         "tool_penalty": penalty,
         "raw_score": raw,
         "final_score": final_score,
-        "tools_invoked": [name for name, _ in tool_calls],
+        "tools_invoked": [name for name, _ in all_tool_calls],
         "relevant_invoked": relevant_invoked,
         "irrelevant_invoked": irrelevant_invoked,
         "unknown_invoked": unknown_invoked,
-        "num_tool_calls": len(tool_calls),
+        "num_tool_calls": len(all_tool_calls),
     }
     return final_score, metadata
 

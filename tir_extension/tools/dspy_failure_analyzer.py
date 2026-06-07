@@ -28,7 +28,7 @@ from tir_extension.data.failure_database import (
     FailureRecord,
     format_failures_for_analyzer,
 )
-from tir_extension.tools.tool_pool import TOOL_REGISTRY, format_tools_for_prompt
+from tir_extension.tools.tool_pool import TOOL_REGISTRY, format_tools_for_prompt, relevant_tool_names
 
 
 DEFAULT_LM_NAME = os.environ.get("DSPY_LM", "openai/gpt-4o-mini")
@@ -129,7 +129,7 @@ class FailureAnalyzerModule:
         if not samples:
             return {
                 "analysis": "no failures available",
-                "recommended_tools": sorted(candidate_set),
+                "recommended_tools": sorted(relevant_tool_names() & candidate_set),
             }
 
         failure_text = format_failures_for_analyzer(samples)
@@ -143,7 +143,7 @@ class FailureAnalyzerModule:
         except Exception as exc:  # noqa: BLE001 - external API
             return {
                 "analysis": f"dspy_error: {exc}",
-                "recommended_tools": sorted(candidate_set),
+                "recommended_tools": sorted(relevant_tool_names() & candidate_set),
             }
 
         analysis = getattr(prediction, "failure_analysis", "") or ""

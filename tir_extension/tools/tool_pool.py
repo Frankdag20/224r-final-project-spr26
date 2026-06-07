@@ -238,6 +238,17 @@ def parse_tool_calls(response: str) -> list[tuple[str, str]]:
     ]
 
 
+def parse_tool_calls_with_results(response: str) -> list[tuple[str, str, str | None]]:
+    """Return ``(name, args, result)`` for each tool call.
+
+    ``result`` is ``None`` when no ``<tool_result>`` block follows the call.
+    """
+    return [
+        (m.group(2), m.group(3), m.group(5))
+        for m in _USE_THEN_RESULT_PATTERN.finditer(response)
+    ]
+
+
 def execute_tool_calls(
     response: str,
     active_tools: Iterable[str] | None = None,

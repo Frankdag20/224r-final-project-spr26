@@ -36,8 +36,21 @@ def _load_records(json_path: str) -> list[dict]:
     return records
 
 
+def _is_pre_formatted(prompt: str) -> bool:
+    """Return True if the prompt is already a rendered chat template string."""
+    return "<|im_start|>" in prompt or "<|im_end|>" in prompt or prompt.startswith("<s>")
+
+
 def _apply_chat_template(tokenizer, prompt: str, completion: str) -> tuple[str, str]:
-    """Format ``prompt``/``completion`` with the model's chat template."""
+    """Format ``prompt``/``completion`` with the model's chat template.
+
+    If the prompt is already a rendered chat-template string (e.g. from a
+    dataset that stores Qwen2.5-formatted prompts), the template is not
+    applied again to avoid double-wrapping.
+    """
+    if _is_pre_formatted(prompt):
+        return prompt, completion
+
     prompt_only = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
