@@ -32,7 +32,7 @@ for model in "${MODELS[@]}"; do
     modal volume get default-proj-training "$REMOTE_PATH" "$LOCAL_PATH"
 
     echo "=== Uploading $model to $REPO_NAME ==="
-    huggingface-cli upload "$REPO_NAME" "$LOCAL_PATH" . --repo-type model
+    hf upload "$REPO_NAME" "$LOCAL_PATH" . --repo-type model
 
     echo "Done: $REPO_NAME"
 done
