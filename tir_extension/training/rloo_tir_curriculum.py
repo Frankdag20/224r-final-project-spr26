@@ -4,11 +4,19 @@ Subclasses ``TIRRLOOTrainer`` to replace the fixed dataloader with a
 curriculum-aware sampler that transitions from 100% medium problems to
 100% hard problems over a configurable number of steps.
 
+Supports two curriculum strategies via ``--curriculum_strategy``:
+  - ``numcount``: 3-number = medium, 4-number = hard (uses ``numcount_difficulty`` column)
+  - ``solvability``: teacher-labeled tool solvability (uses ``solvability`` column)
+
+Also supports ``--curriculum_strategy none`` for a uniform-sampling baseline.
+
+Dataset: ``sbfisher/countdown_curriculum`` (490k problems with both label types).
+
 Usage:
 
     modal run modal_train.py tir_curriculum -- \
-        --dataset_name mih123/RL_calc_training_set \
-        --model_name sbfisher/tir-sft-3tool_from_sft \
+        --dataset_name sbfisher/countdown_curriculum \
+        --curriculum_strategy numcount \
         --num_training_steps 150 \
         --curriculum_end_step 110
 """
@@ -45,12 +53,10 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
     def __init__(
         self,
         curriculum_end_step: int = 110,
+        curriculum_strategy: str = "numcount",
         **kwargs,
     ):
         # Override dataset loading to handle missing test split.
-        # We patch before super().__init__ so the base class doesn't crash.
-        original_get_dataloaders = get_dataloaders.__wrapped__ if hasattr(get_dataloaders, '__wrapped__') else None
-
         import rloo_trainer.rloo_dataset as _ds_mod
         _orig_get_dl = _ds_mod.get_dataloaders
 
@@ -63,7 +69,6 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
                 available = {"train"}
             safe_splits = [s for s in (splits or ["train"]) if s in available]
             result = _orig_get_dl(dataset_name, splits=safe_splits, **dl_kwargs)
-            # Provide a dummy test loader if missing
             for s in (splits or []):
                 if s not in result:
                     result[s] = _orig_get_dl(dataset_name, splits=["train"], **dl_kwargs)["train"]
@@ -73,24 +78,44 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
         super().__init__(**kwargs)
         _ds_mod.get_dataloaders = _orig_get_dl
         self.curriculum_end_step = curriculum_end_step
+        self.curriculum_strategy = curriculum_strategy
 
         # Load dataset and split by difficulty
         print(f"[Curriculum] Loading dataset {self.dataset_name} for curriculum split")
+        print(f"[Curriculum] Strategy: {curriculum_strategy}")
         ds = load_dataset(self.dataset_name, split="train")
 
-        self.medium_examples = [
-            {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]}
-            for i in range(len(ds)) if ds[i]["difficulty"] == "medium"
-        ]
-        self.hard_examples = [
-            {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]}
-            for i in range(len(ds)) if ds[i]["difficulty"] == "hard"
-        ]
-        print(f"[Curriculum] Medium: {len(self.medium_examples)}, Hard: {len(self.hard_examples)}")
-        print(f"[Curriculum] Schedule: 100% medium at step 0 → 100% hard at step {self.curriculum_end_step}")
+        if curriculum_strategy == "none":
+            # No curriculum — all examples go into one pool
+            self.all_examples = [
+                {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]}
+                for i in range(len(ds))
+            ]
+            self.medium_examples = self.all_examples
+            self.hard_examples = self.all_examples
+            print(f"[Curriculum] No curriculum: {len(self.all_examples)} total examples (uniform sampling)")
+        else:
+            if curriculum_strategy == "numcount":
+                diff_col = "numcount_difficulty"
+            elif curriculum_strategy == "solvability":
+                diff_col = "solvability"
+            else:
+                raise ValueError(f"Unknown curriculum_strategy: {curriculum_strategy}")
+
+            self.medium_examples = [
+                {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]}
+                for i in range(len(ds)) if ds[i][diff_col] == "medium"
+            ]
+            self.hard_examples = [
+                {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]}
+                for i in range(len(ds)) if ds[i][diff_col] == "hard"
+            ]
+            print(f"[Curriculum] Medium: {len(self.medium_examples)}, Hard: {len(self.hard_examples)}")
+            print(f"[Curriculum] Schedule: 100% medium at step 0 → 100% hard at step {self.curriculum_end_step}")
 
         self.wandb.config.update({
             "curriculum_end_step": curriculum_end_step,
+            "curriculum_strategy": curriculum_strategy,
             "curriculum_n_medium": len(self.medium_examples),
             "curriculum_n_hard": len(self.hard_examples),
         })
@@ -103,15 +128,17 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
 
     def _sample_curriculum_batch(self, step: int) -> dict:
         """Sample a batch with curriculum-weighted mix of medium and hard."""
-        hard_frac = self._get_hard_fraction(step)
-        n_hard = int(round(hard_frac * self.batch_size))
-        n_medium = self.batch_size - n_hard
-
-        batch_examples = (
-            random.choices(self.medium_examples, k=n_medium)
-            + random.choices(self.hard_examples, k=n_hard)
-        )
-        random.shuffle(batch_examples)
+        if self.curriculum_strategy == "none":
+            batch_examples = random.choices(self.all_examples, k=self.batch_size)
+        else:
+            hard_frac = self._get_hard_fraction(step)
+            n_hard = int(round(hard_frac * self.batch_size))
+            n_medium = self.batch_size - n_hard
+            batch_examples = (
+                random.choices(self.medium_examples, k=n_medium)
+                + random.choices(self.hard_examples, k=n_hard)
+            )
+            random.shuffle(batch_examples)
 
         return {
             "prompt": [ex["prompt"] for ex in batch_examples],
@@ -311,7 +338,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref_model_name", type=str, default=None)
     parser.add_argument("--tokenizer_name", type=str, default=None)
     parser.add_argument("--dataset_name", type=str,
-                        default="mih123/RL_calc_training_set")
+                        default="sbfisher/countdown_curriculum")
     parser.add_argument("--wandb_project", type=str, default="tir_rloo_curriculum")
     parser.add_argument("--wandb_name", type=str, default="curriculum_medium_to_hard")
     parser.add_argument("--lr_schedule", type=str, default="constant")
@@ -359,6 +386,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # Curriculum-specific
     parser.add_argument("--curriculum_end_step", type=int, default=110,
                         help="Step at which training is 100%% hard problems.")
+    parser.add_argument("--curriculum_strategy", type=str, default="numcount",
+                        choices=["numcount", "solvability", "none"],
+                        help="How to split medium/hard: numcount (3-num/4-num), "
+                             "solvability (teacher-labeled tool solvability), "
+                             "or none (uniform sampling baseline).")
     return parser
 
 
@@ -423,6 +455,7 @@ def main():
     ray.init()
     trainer = CurriculumTIRRLOOTrainer(
         curriculum_end_step=args.curriculum_end_step,
+        curriculum_strategy=args.curriculum_strategy,
         **tir_kwargs,
         **rloo_kwargs,
     )

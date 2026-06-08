@@ -1,0 +1,7 @@
+.git/
+.venv/
+__pycache__/
+*.pyc
+difficulty_labels_v2/
+difficulty_labels_v4/
+difficulty_labels_old/

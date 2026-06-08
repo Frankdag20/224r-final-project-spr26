@@ -257,6 +257,73 @@ Vanilla SFT baseline (no TIR): pass@1 = 31.5%, pass@16 = 76.0%
 
 ---
 
+## Run 14: Difficulty Labeling — Qwen3-32B Teacher on Full Dataset
+
+**Motivation:** Label all ~490k Countdown problems with difficulty scores to enable curriculum learning for RLOO. The teacher model solves each problem twice (without tools, with tools) and optionally assigns a 1-10 difficulty rating. This produces three potential curriculum strategies:
+1. **Tool-based solvability**: Easy (solved without tools), Medium (solved only with tools), Hard (unsolved even with tools)
+2. **Teacher difficulty scores**: 1-10 rating from `<difficulty>N</difficulty>` tags
+3. **Number count**: 3-number = easy, 4-number = hard (trivial heuristic baseline)
+
+- **Date**: 2026-06-08
+- **Teacher model**: Qwen/Qwen3-32B (with `enable_thinking=False` via `tokenizer.apply_chat_template`)
+- **Infrastructure**: 5 shards × 2×H100 (tensor parallelism (TP)=2), Modal
+- **Dataset**: `Jiayi-Pan/Countdown` (train split, 490,314 problems)
+- **Config**: `max_tokens=2048`, `max_model_len=4096`, `batch_size=512`, `temperature=0.0`
+- **No-tools system prompt**: `"You are a helpful assistant."` + difficulty instruction (matches vanilla RLOO student prompt exactly)
+- **With-tools system prompt**: `build_tool_system_prompt()` (full I^T with tool catalogue + worked example) + difficulty instruction
+- **Script**: `tir_extension/curriculum/label_difficulty.py`
+- **Output**: `difficulty_labels_full/shard_{0-4}.jsonl` (490,314 total lines)
+- **Status**: COMPLETE
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Total problems | 490,314 |
+| No-tools correct | 210,929 (43.0%) |
+| With-tools correct | 230,792 (47.1%) |
+| Tools helped (solved only with tools) | 50,316 (10.3%) |
+| Tools hurt (solved only without tools) | 30,453 (6.2%) |
+| Difficulty parsed (no-tools) | 41,286 (8.4%) |
+| Difficulty parsed (with-tools) | 77,182 (15.7%) |
+| 3-number problems | 240,608 (49.1%) |
+| 4-number problems | 249,706 (50.9%) |
+
+### Strategy 1 Split (Tool-Based Solvability)
+
+| Difficulty | Count | Fraction |
+|-----------|-------|----------|
+| Easy (solved w/o tools) | 210,929 | 43.0% |
+| Medium (solved only w/ tools) | 50,316 | 10.3% |
+| Hard (unsolved) | 229,069 | 46.7% |
+
+### Difficulty Parsing Rate by Solvability Category
+
+| Category | Total | No-tools parsed | With-tools parsed |
+|----------|-------|----------------|-------------------|
+| Easy (solved w/o tools) | 210,929 | 16.4% | 24.8% |
+| Medium (solved only w/ tools) | 50,316 | 6.7% | 29.2% |
+| Hard (unsolved) | 229,069 | 1.4% | 4.5% |
+
+Hard problems almost never produce a `<difficulty>` tag — the model exhausts its 2048 token budget trying (and failing) to solve them. Strategy 2 (teacher difficulty scores) is not viable as-is.
+
+### Solvability × Number Count Cross-Tabulation
+
+|  | 3-number | 4-number |
+|--|----------|----------|
+| Easy | 165,848 (68.9% of 3-num) | 45,081 (18.1% of 4-num) |
+| Medium | 22,659 (9.4%) | 27,657 (11.1%) |
+| Hard | 52,101 (21.7%) | 176,968 (70.9%) |
+
+Number count is a decent but imperfect proxy: 3-number problems are mostly easy (69%) but 22% are hard even for the teacher. 4-number problems are mostly hard (71%) but 18% are easy. The medium bucket (where tools actually help) is spread evenly across both (~10%).
+
+### Notes
+- Low difficulty parsing rates (8-16%) because the model runs out of tokens on hard problems before outputting `<difficulty>` tags. Strategy 2 (teacher difficulty scores) may not be viable as-is.
+- The medium bucket is small (10.3%) — curriculum that trains medium→hard will have limited medium diversity. May need to oversample or combine with number-count heuristic.
+- Tools provide a net benefit (+4.1pp accuracy), but also hurt on 6.2% of problems (likely due to incorrect tool calls or wasted token budget).
+
+---
+
 ## Prior Data (from Mahmood's branch `tir_extension_mih`)
 - `tir_trajectories.json`: 414 trajectories, all score=1.0, all with tool calls
   - Tool usage: calculator (559 calls), number_tracker (90), running_total (34)
