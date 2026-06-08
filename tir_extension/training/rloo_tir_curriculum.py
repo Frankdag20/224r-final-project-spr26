@@ -44,6 +44,10 @@ from datasets import load_dataset
 
 from evaluation.countdown import compute_score
 from rloo_trainer.rloo_dataset import RLOODataset, get_dataloaders
+from tir_extension.training.hierarchical_reward import (
+    compute_hierarchical_reward,
+    aggregate_hierarchical_metrics,
+)
 from tir_extension.training.rloo_tir import TIRRLOOTrainer, _inject_tool_system_prompt
 
 
@@ -56,34 +60,44 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
         curriculum_strategy: str = "numcount",
         **kwargs,
     ):
-        # Override dataset loading to handle missing test split.
+        # The curriculum trainer uses _sample_curriculum_batch instead of the
+        # parent's dataloader, so we stub out get_dataloaders to avoid loading
+        # the curriculum dataset through RLOODataset (which can fail due to HF
+        # metadata schema mismatches with extra columns like difficulty_score).
         import rloo_trainer.rloo_dataset as _ds_mod
+        from torch.utils.data import DataLoader, TensorDataset
+        import torch
         _orig_get_dl = _ds_mod.get_dataloaders
 
-        def _safe_get_dataloaders(dataset_name, splits=None, **dl_kwargs):
-            """Load only available splits; create empty loader for missing ones."""
-            from datasets import get_dataset_split_names
-            try:
-                available = set(get_dataset_split_names(dataset_name))
-            except Exception:
-                available = {"train"}
-            safe_splits = [s for s in (splits or ["train"]) if s in available]
-            result = _orig_get_dl(dataset_name, splits=safe_splits, **dl_kwargs)
-            for s in (splits or []):
-                if s not in result:
-                    result[s] = _orig_get_dl(dataset_name, splits=["train"], **dl_kwargs)["train"]
-            return result
+        def _dummy_get_dataloaders(dataset_name, splits=None, **dl_kwargs):
+            """Return empty dataloaders — curriculum trainer never uses them."""
+            dummy = TensorDataset(torch.zeros(1))
+            return {s: DataLoader(dummy) for s in (splits or ["train"])}
 
-        _ds_mod.get_dataloaders = _safe_get_dataloaders
+        _ds_mod.get_dataloaders = _dummy_get_dataloaders
         super().__init__(**kwargs)
         _ds_mod.get_dataloaders = _orig_get_dl
         self.curriculum_end_step = curriculum_end_step
         self.curriculum_strategy = curriculum_strategy
 
-        # Load dataset and split by difficulty
+        # Load dataset and split by difficulty.
+        # Use trust_remote_code and ignore HF metadata schema to handle
+        # datasets where the parquet has extra columns (e.g. difficulty_score)
+        # that aren't in the auto-generated dataset card.
         print(f"[Curriculum] Loading dataset {self.dataset_name} for curriculum split")
         print(f"[Curriculum] Strategy: {curriculum_strategy}")
-        ds = load_dataset(self.dataset_name, split="train")
+        try:
+            ds = load_dataset(self.dataset_name, split="train")
+        except Exception:
+            # Schema mismatch — load parquet directly, bypassing HF metadata
+            from huggingface_hub import hf_hub_download
+            pq_path = hf_hub_download(
+                repo_id=self.dataset_name,
+                filename="data/train-00000-of-00001.parquet",
+                repo_type="dataset",
+            )
+            ds = load_dataset("parquet", data_files=pq_path, split="train")
+            print(f"[Curriculum] Loaded via direct parquet (bypassed HF metadata)")
 
         if curriculum_strategy == "none":
             # No curriculum — all examples go into one pool
@@ -94,6 +108,41 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
             self.medium_examples = self.all_examples
             self.hard_examples = self.all_examples
             print(f"[Curriculum] No curriculum: {len(self.all_examples)} total examples (uniform sampling)")
+        elif curriculum_strategy == "hard_only":
+            # Tool-Star style: RL on hard (unsolved) problems only
+            self.all_examples = [
+                {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]}
+                for i in range(len(ds)) if ds[i]["solvability"] == "hard"
+            ]
+            self.medium_examples = self.all_examples
+            self.hard_examples = self.all_examples
+            print(f"[Curriculum] Hard-only (Tool-Star): {len(self.all_examples)} examples (uniform sampling)")
+        elif curriculum_strategy == "score":
+            # Score-based curriculum: sort by difficulty score, ramp eligible
+            # pool size from easiest 20% to 100% by count (not threshold).
+            all_with_score = [
+                (ds[i]["difficulty_score"],
+                 {"prompt": ds[i]["prompt"], "ground_truth": ds[i]["ground_truth"]})
+                for i in range(len(ds))
+            ]
+            all_with_score.sort(key=lambda x: x[0])
+            self.sorted_examples = [ex for _, ex in all_with_score]
+
+            # Print score distribution
+            from collections import Counter
+            score_counts = Counter(ds["difficulty_score"])
+            for s in sorted(score_counts):
+                print(f"[Curriculum] Score {s}: {score_counts[s]} examples")
+
+            # Starting fraction: include easiest 20% at step 0
+            self.score_start_frac = 0.2
+            n_start = int(self.score_start_frac * len(self.sorted_examples))
+            print(f"[Curriculum] Score ramp: {n_start} examples (easiest 20%) at step 0 "
+                  f"→ {len(self.sorted_examples)} (100%) at step {self.curriculum_end_step}")
+
+            # For config logging
+            self.medium_examples = self.sorted_examples[:n_start]
+            self.hard_examples = self.sorted_examples[n_start:]
         else:
             if curriculum_strategy == "numcount":
                 diff_col = "numcount_difficulty"
@@ -126,10 +175,21 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
             return 1.0
         return step / self.curriculum_end_step
 
+    def _get_score_pool_size(self, step: int) -> int:
+        """Linear ramp from start_frac to 1.0 of sorted examples."""
+        total = len(self.sorted_examples)
+        if step >= self.curriculum_end_step:
+            return total
+        frac = self.score_start_frac + (1.0 - self.score_start_frac) * step / self.curriculum_end_step
+        return max(1, int(frac * total))
+
     def _sample_curriculum_batch(self, step: int) -> dict:
         """Sample a batch with curriculum-weighted mix of medium and hard."""
-        if self.curriculum_strategy == "none":
+        if self.curriculum_strategy in ("none", "hard_only"):
             batch_examples = random.choices(self.all_examples, k=self.batch_size)
+        elif self.curriculum_strategy == "score":
+            pool_size = self._get_score_pool_size(step)
+            batch_examples = random.choices(self.sorted_examples[:pool_size], k=self.batch_size)
         else:
             hard_frac = self._get_hard_fraction(step)
             n_hard = int(round(hard_frac * self.batch_size))
@@ -145,187 +205,252 @@ class CurriculumTIRRLOOTrainer(TIRRLOOTrainer):
             "ground_truth": [ex["ground_truth"] for ex in batch_examples],
         }
 
-    def train(self):
-        """Run curriculum RLOO training."""
+    def train(self):  # type: ignore[override]
+        """Run curriculum RLOO training.
+
+        Identical to ``TIRRLOOTrainer.train()`` except data comes from
+        ``_sample_curriculum_batch`` instead of the dataloader.
+        """
+        import random as rng
         import shutil
 
         last_checkpoint_dir = None
         global_step = 0
-
         # Collect prompts+gt for self-critic sampling
         self_critic_buffer: list[tuple[str, dict]] = []
 
-        while global_step < self.num_training_steps:
-            # ----- Sample curriculum batch -----
-            hard_frac = self._get_hard_fraction(global_step)
-            batch = self._sample_curriculum_batch(global_step)
+        for epoch in range(self.num_epochs):
+            if global_step > 0 and global_step == self.num_training_steps:
+                break
 
-            print(
-                f"[Curriculum] step={global_step} hard_frac={hard_frac:.2f} "
-                f"(medium={self.batch_size - int(round(hard_frac * self.batch_size))}, "
-                f"hard={int(round(hard_frac * self.batch_size))})",
-                flush=True,
-            )
+            # Instead of iterating the dataloader, we generate batches on the fly.
+            # Each iteration = one training step (same as original).
+            while global_step < self.num_training_steps:
+                # ----- Curriculum batch (only difference from original) -----
+                batch = self._sample_curriculum_batch(global_step)
 
-            # ----- 1) Sample -----
-            print(
-                f"[TIR] Sampling, step={global_step}",
-                flush=True,
-            )
-            model_path = (
-                self.model_name
-                if last_checkpoint_dir is None
-                else os.path.join(last_checkpoint_dir, "model")
-            )
-            self._create_sampling_worker(model_path)
-
-            all_prompts_raw = batch["prompt"]
-            all_ground_truth = batch["ground_truth"]
-            assert len(all_prompts_raw) == len(all_ground_truth) == self.batch_size
-
-            # Inject I^T
-            all_prompts = [
-                _inject_tool_system_prompt(p, self._tool_system_prompt)
-                for p in all_prompts_raw
-            ]
-            all_responses, all_sample_log_probs = ray.get(
-                self.sampling_worker.generate.remote(all_prompts)
-            )
-
-            # ----- 2) Rewards -----
-            all_rewards: list[list[float]] = []
-            all_meta: list[dict] = []
-            for resp_group, gt in zip(all_responses, all_ground_truth):
-                group_rewards = []
-                for resp in resp_group:
-                    if self.use_vanilla_reward:
-                        base = compute_score(resp, gt)
-                        group_rewards.append(base)
-                        all_meta.append({
-                            "base_score": base,
-                            "final_reward": base,
-                            "good_format": base > 0.0,
-                            "accuracy": 1.0 if base >= 1.0 else 0.0,
-                            "rM": 0.0,
-                            "distinct_relevant_tools": [],
-                            "n_distinct_relevant_tools": 0,
-                            "n_total_tool_calls": 0,
-                        })
-                    else:
-                        from tir_extension.training.hierarchical_reward import compute_hierarchical_reward
-                        reward, meta = compute_hierarchical_reward(
-                            response=resp,
-                            ground_truth=gt,
-                            active_tools=self.active_tools,
-                            multi_tool_bonus=self.multi_tool_bonus,
-                            min_tools_for_bonus=self.min_tools_for_bonus,
-                        )
-                        group_rewards.append(reward)
-                        all_meta.append(meta)
-                all_rewards.append(group_rewards)
-
-            reward_mean = float(np.mean(all_rewards))
-            base_score_mean = float(
-                np.mean([m["base_score"] for m in all_meta])
-            )
-            accuracy_mean = float(
-                np.mean([m["accuracy"] for m in all_meta])
-            )
-            print(
-                f"[TIR] step={global_step} reward_mean={reward_mean:.3f} "
-                f"base_score_mean={base_score_mean:.3f} accuracy={accuracy_mean:.3f}",
-                flush=True,
-            )
-
-            generation_table = self._build_generation_table(
-                all_prompts, all_responses, all_rewards
-            )
-
-            # Buffer prompts for self-critic
-            if self.self_critic:
-                for p, gt in zip(all_prompts_raw, all_ground_truth):
-                    self_critic_buffer.append((p, gt))
-                if len(self_critic_buffer) > 64:
-                    self_critic_buffer = self_critic_buffer[-64:]
-
-            # ----- 3) Tokenize + Update -----
-            tokenized = self._tokenize_rollouts_tir(
-                batch={"prompt": all_prompts},
-                all_responses=all_responses,
-                all_rewards=all_rewards,
-                all_sample_log_probs=all_sample_log_probs,
-            )
-
-            save_dir = os.path.join(
-                self.save_dir, self.wandb_project, self.wandb_name, "latest_checkpoint"
-            )
-            os.makedirs(save_dir, exist_ok=True)
-            save_model_path = os.path.join(save_dir, "model")
-            save_optimizer_path = os.path.join(save_dir, "optimizer.pt")
-            save_scheduler_path = os.path.join(save_dir, "scheduler.pt")
-
-            self._create_update_worker(
-                model_path=model_path,
-                save_model_path=save_model_path,
-                save_optimizer_path=save_optimizer_path,
-                save_scheduler_path=save_scheduler_path,
-            )
-
-            update_metrics = ray.get(
-                self.update_worker.update.remote(tokenized)
-            )
-            ray.get(self.update_worker.save_checkpoint.remote())
-
-            # ----- 4) Log -----
-            agg_metrics = {}
-            from tir_extension.training.hierarchical_reward import aggregate_hierarchical_metrics
-            agg_metrics = aggregate_hierarchical_metrics(all_meta)
-
-            log_dict = {
-                "reward_mean": reward_mean,
-                "base_score_mean": base_score_mean,
-                "accuracy_mean": accuracy_mean,
-                "curriculum_hard_frac": hard_frac,
-                **{f"update/{k}": v for k, v in update_metrics.items()},
-                **{f"reward/{k}": v for k, v in agg_metrics.items()},
-                "generation_table": generation_table,
-            }
-            self.wandb.log(log_dict, step=global_step)
-
-            last_checkpoint_dir = save_dir
-
-            # ----- 5) Self-critic -----
-            if (
-                self.self_critic
-                and global_step > 0
-                and global_step % self.self_critic_every_k == 0
-                and len(self_critic_buffer) >= self.batch_size
-            ):
-                sc_prompts = random.sample(
-                    self_critic_buffer, min(len(self_critic_buffer), self.batch_size)
-                )
-                dpo_metrics = self._run_self_critic(
-                    model_path=save_model_path,
-                    prompts_with_gt=sc_prompts,
-                    global_step=global_step,
-                )
-                if dpo_metrics:
-                    self.wandb.log(
-                        {f"self_critic/{k}": v for k, v in dpo_metrics.items()},
-                        step=global_step,
+                if self.curriculum_strategy == "score":
+                    pool_size = self._get_score_pool_size(global_step)
+                    print(
+                        f"[Curriculum] step={global_step} score_pool_size="
+                        f"{pool_size}/{len(self.sorted_examples)} "
+                        f"({100*pool_size/len(self.sorted_examples):.1f}%)",
+                        flush=True,
+                    )
+                elif self.curriculum_strategy in ("none", "hard_only"):
+                    print(
+                        f"[Curriculum] step={global_step} ({self.curriculum_strategy})",
+                        flush=True,
+                    )
+                else:
+                    hard_frac = self._get_hard_fraction(global_step)
+                    print(
+                        f"[Curriculum] step={global_step} hard_frac={hard_frac:.2f} "
+                        f"(medium={self.batch_size - int(round(hard_frac * self.batch_size))}, "
+                        f"hard={int(round(hard_frac * self.batch_size))})",
+                        flush=True,
                     )
 
-            # ----- 6) Periodic save -----
-            if self.save_every_n_steps > 0 and global_step % self.save_every_n_steps == 0:
-                step_save_dir = os.path.join(
-                    self.save_dir, self.wandb_project, self.wandb_name,
-                    f"step_{global_step}"
+                # ----- 1) Sample -----
+                print(
+                    f"[TIR] Sampling, epoch={epoch} step={global_step}",
+                    flush=True,
                 )
-                if os.path.exists(save_dir):
-                    shutil.copytree(save_dir, step_save_dir, dirs_exist_ok=True)
-                    print(f"[Curriculum] Saved step {global_step} checkpoint to {step_save_dir}")
+                model_path = (
+                    self.model_name
+                    if last_checkpoint_dir is None
+                    else os.path.join(last_checkpoint_dir, "model")
+                )
+                self._create_sampling_worker(model_path)
 
-            global_step += 1
+                all_prompts_raw = batch["prompt"]
+                all_ground_truth = batch["ground_truth"]
+                assert (
+                    len(all_prompts_raw) == len(all_ground_truth) == self.batch_size
+                )
+
+                # Inject I^T
+                all_prompts = [
+                    _inject_tool_system_prompt(p, self._tool_system_prompt)
+                    for p in all_prompts_raw
+                ]
+                all_responses, all_sample_log_probs = ray.get(
+                    self.sampling_worker.generate.remote(all_prompts)
+                )
+
+                # ----- 2) Rewards -----
+                all_rewards: list[list[float]] = []
+                all_meta: list[dict] = []
+                for resp_group, gt in zip(all_responses, all_ground_truth):
+                    group_rewards = []
+                    for resp in resp_group:
+                        if self.use_vanilla_reward:
+                            base = compute_score(resp, gt)
+                            group_rewards.append(base)
+                            all_meta.append({
+                                "base_score": base,
+                                "final_reward": base,
+                                "good_format": base > 0.0,
+                                "accuracy": 1.0 if base >= 1.0 else 0.0,
+                                "rM": 0.0,
+                                "distinct_relevant_tools": [],
+                                "n_distinct_relevant_tools": 0,
+                                "n_total_tool_calls": 0,
+                            })
+                        else:
+                            reward, meta = compute_hierarchical_reward(
+                                response=resp,
+                                ground_truth=gt,
+                                active_tools=self.active_tools,
+                                multi_tool_bonus=self.multi_tool_bonus,
+                                min_tools_for_bonus=self.min_tools_for_bonus,
+                            )
+                            group_rewards.append(reward)
+                            all_meta.append(meta)
+                    all_rewards.append(group_rewards)
+
+                reward_mean = float(np.mean(all_rewards))
+                base_score_mean = float(
+                    np.mean([m["base_score"] for m in all_meta])
+                )
+                print(
+                    f"[TIR] step={global_step} reward_mean={reward_mean:.3f} "
+                    f"base_score_mean={base_score_mean:.3f}",
+                    flush=True,
+                )
+
+                generation_table = self._build_generation_table(
+                    all_prompts, all_responses, all_rewards
+                )
+
+                # Buffer prompts for self-critic
+                if self.self_critic:
+                    for p, gt in zip(all_prompts_raw, all_ground_truth):
+                        self_critic_buffer.append((p, gt))
+                    if len(self_critic_buffer) > self.batch_size * 10:
+                        self_critic_buffer = self_critic_buffer[-self.batch_size * 5:]
+
+                # ----- 3) Tokenize -----
+                tokenized = self.tokenize_batch_tir(
+                    {
+                        "prompt": all_prompts,
+                        "response": all_responses,
+                        "rewards": all_rewards,
+                        "sample_log_probs": all_sample_log_probs,
+                    }
+                )
+
+                # ----- 4) RLOO Update -----
+                optimizer_path = (
+                    None
+                    if last_checkpoint_dir is None
+                    else os.path.join(last_checkpoint_dir, "optimizer.pt")
+                )
+                scheduler_path = (
+                    None
+                    if last_checkpoint_dir is None
+                    else os.path.join(last_checkpoint_dir, "scheduler.pt")
+                )
+                self._create_update_worker(model_path, optimizer_path, scheduler_path)
+
+                all_metrics = ray.get(
+                    self.update_worker.update_gradient_accumulation.remote(
+                        input_ids=tokenized["input_ids"],
+                        attention_mask=tokenized["attention_mask"],
+                        is_response_token=tokenized["is_response_token"],
+                        rewards=tokenized["rewards"],
+                        sample_log_probs=tokenized["sample_log_probs"],
+                        tool_result_mask=tokenized["tool_result_mask"],
+                    )
+                )
+
+                # ----- 5) Checkpoint -----
+                if self.save_every_n_steps > 0 and global_step % self.save_every_n_steps == 0:
+                    save_dir = os.path.join(
+                        self.save_dir, self.wandb_project, self.wandb_name,
+                        f"epoch_{epoch}_step_{global_step}",
+                    )
+                else:
+                    save_dir = os.path.join(
+                        self.save_dir, self.wandb_project, self.wandb_name,
+                        "latest_checkpoint",
+                    )
+                if os.path.exists(save_dir):
+                    shutil.rmtree(save_dir)
+                os.makedirs(save_dir, exist_ok=True)
+
+                save_model_path = os.path.join(save_dir, "model")
+                save_optimizer_path = os.path.join(save_dir, "optimizer.pt")
+                save_scheduler_path = os.path.join(save_dir, "scheduler.pt")
+                ray.get(
+                    self.update_worker.update_checkpoint_paths.remote(
+                        model_path=save_model_path,
+                        optimizer_path=save_optimizer_path,
+                        scheduler_path=save_scheduler_path,
+                        load_checkpoint=False,
+                    )
+                )
+                ray.get(self.update_worker.save_checkpoint.remote())
+                last_checkpoint_dir = save_dir
+
+                # ----- 6) Self-Critic DPO (Tool-Star Algorithm 1) -----
+                dpo_metrics = None
+                if (
+                    self.self_critic
+                    and (global_step + 1) % self.self_critic_every_k == 0
+                    and len(self_critic_buffer) >= self.batch_size
+                ):
+                    sc_prompts = rng.sample(
+                        self_critic_buffer,
+                        min(self.batch_size, len(self_critic_buffer)),
+                    )
+                    sc_model_path = os.path.join(last_checkpoint_dir, "model")
+                    dpo_metrics = self._run_self_critic(
+                        sc_model_path, sc_prompts, global_step
+                    )
+
+                # ----- 7) Logging -----
+                hier_metrics = aggregate_hierarchical_metrics(all_meta)
+                rollout_accuracy = float(
+                    np.mean([1.0 if m["base_score"] >= 1.0 else 0.0 for m in all_meta])
+                )
+
+                curriculum_metrics = {}
+                if self.curriculum_strategy == "score":
+                    pool_size = self._get_score_pool_size(global_step)
+                    curriculum_metrics["curriculum/score_pool_frac"] = pool_size / len(self.sorted_examples)
+                elif self.curriculum_strategy not in ("none", "hard_only"):
+                    curriculum_metrics["curriculum/hard_frac"] = self._get_hard_fraction(global_step)
+
+                log_dict = {
+                    "train/epoch": epoch,
+                    "train/global_step": global_step,
+                    "sampling/reward_mean": reward_mean,
+                    "sampling/base_score_mean": base_score_mean,
+                    "sampling/rollout_accuracy": rollout_accuracy,
+                    **{f"train/{k}": v for k, v in all_metrics.items()},
+                    **hier_metrics,
+                    **curriculum_metrics,
+                }
+                if dpo_metrics is not None:
+                    log_dict.update({
+                        f"self_critic/{k}": v for k, v in dpo_metrics.items()
+                    })
+                if generation_table is not None:
+                    log_dict["samples/generations"] = generation_table
+
+                self.wandb.log(log_dict, step=global_step)
+                global_step += 1
+
+        # Tear down
+        if self.sampling_worker is not None:
+            ray.kill(self.sampling_worker)
+            self.sampling_worker = None
+        if self.update_worker is not None:
+            ray.kill(self.update_worker)
+            self.update_worker = None
+        ray.shutdown()
+        self.wandb.finish()
 
         print(f"[Curriculum] Training complete at step {global_step}")
 
@@ -387,10 +512,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum_end_step", type=int, default=110,
                         help="Step at which training is 100%% hard problems.")
     parser.add_argument("--curriculum_strategy", type=str, default="numcount",
-                        choices=["numcount", "solvability", "none"],
+                        choices=["numcount", "solvability", "score", "none", "hard_only"],
                         help="How to split medium/hard: numcount (3-num/4-num), "
                              "solvability (teacher-labeled tool solvability), "
-                             "or none (uniform sampling baseline).")
+                             "score (teacher difficulty score 1-10, threshold ramp), "
+                             "none (uniform sampling baseline), "
+                             "or hard_only (Tool-Star: RL on unsolved problems only).")
     return parser
 
 
