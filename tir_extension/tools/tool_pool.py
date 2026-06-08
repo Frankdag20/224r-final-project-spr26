@@ -159,8 +159,9 @@ TOOL_REGISTRY: dict[str, dict] = {
     "running_total": {
         "fn": running_total,
         "description": (
-            "Sum a sequence of partial results to track progress toward the "
-            "target. Pass any whitespace/comma-separated numbers."
+            "Cumulatively add a sequence of numbers and show the running sum "
+            "after each step. Pass whitespace/comma-separated numbers. "
+            "Example: '35 44 19' returns 'total: 98 | steps: 35 -> 79 -> 98'."
         ),
         "relevant": True,
     },

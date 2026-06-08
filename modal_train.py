@@ -294,6 +294,32 @@ def _run_eval_script(script_path: str, eval_args: list[str]) -> str:
     volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
     secrets=_build_secret_list(),
 )
+def run_tir_curriculum(trainer_args: list[str]) -> str:
+    return _run_training("tir_extension/training/rloo_tir_curriculum.py", trainer_args)
+
+
+@app.function(
+    image=base_image,
+    gpu="H100:2",
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
+def run_label_difficulty(trainer_args: list[str]) -> str:
+    return _run_training("tir_extension/curriculum/label_difficulty.py", trainer_args)
+
+
+@app.function(
+    image=base_image,
+    gpu=GPU_CONFIG,
+    cpu=CPU_COUNT,
+    timeout=TIMEOUT_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    volumes={str(REMOTE_VOLUME_ROOT): TRAINING_VOLUME},
+    secrets=_build_secret_list(),
+)
 def push_to_hf(args: list[str]) -> str:
     import argparse as _ap
     p = _ap.ArgumentParser()
@@ -321,7 +347,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "trainer",
-        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo", "eval_tir", "push_hf"),
+        choices=("sft", "ipo", "rloo", "eval", "tir_gen", "tir_sft", "tir_rloo", "tir_curriculum", "eval_tir", "label_difficulty", "push_hf"),
     )
     parser.add_argument(
         "trainer_args",
@@ -352,8 +378,12 @@ def main(*raw_args: str) -> None:
         result = run_tir_sft.remote(trainer_args)
     elif args.trainer == "tir_rloo":
         result = run_tir_rloo.remote(trainer_args)
+    elif args.trainer == "tir_curriculum":
+        result = run_tir_curriculum.remote(trainer_args)
     elif args.trainer == "eval_tir":
         result = run_eval_tir.remote(trainer_args)
+    elif args.trainer == "label_difficulty":
+        result = run_label_difficulty.remote(trainer_args)
     elif args.trainer == "push_hf":
         result = push_to_hf.remote(trainer_args)
     else:
